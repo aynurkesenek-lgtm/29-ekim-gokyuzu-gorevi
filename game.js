@@ -1,0 +1,2879 @@
+/**
+ * 29 Ekim Gökyüzü Görevi — Cumhuriyet İçin Uç, Bayrakları Topla!
+ * HTML5 Canvas 2D Eğitim ve Bayram Uçuş Oyunu
+ *
+ * Mantıksal dünya boyutu: 1600 x 900
+ * Üst HUD güvenli alanı: y = 0..92
+ * Aktif uçuş koridoru: y = 96..734 (Uçak merkezi: y = 132..700)
+ * Alt kontrol paneli güvenli alanı: y = 740..900
+ */
+
+(function () {
+  'use strict';
+
+  // ============================================================================
+  // 1. SABİTLER VE DÜNYA KOORDİNAT SİSTEMİ
+  // ============================================================================
+  const WORLD_W = 1600;
+  const WORLD_H = 900;
+
+  const HUD_SAFE_Y = 96;
+  const DOCK_SAFE_Y = 736;
+
+  // Uçak boyutları: Dünya genişliğinin %8'i (128 birim)
+  const PLANE_VISUAL_W = 128;
+  const PLANE_VISUAL_H = 64;
+  // Hitbox görsel sınırlardan ~%22 daha küçük (köşe temaslarında adil)
+  const PLANE_HITBOX_W = 98;
+  const PLANE_HITBOX_H = 48;
+  // Bayrak toplama alanı çarpışma alanından daha cömert
+  const PLANE_COLLECT_W = 136;
+  const PLANE_COLLECT_H = 72;
+  // Doğrudan sürükleme yakalama alanı (görselden geniş, hitbox ile karışmaz)
+  const PLANE_GRAB_HALF_W = 105;
+  const PLANE_GRAB_HALF_H = 75;
+
+  // Uçak hareket sınırları (HUD ve alt kontrol paneline asla girmez)
+  const PLAY_MIN_X = 115;
+  const PLAY_MAX_X = 940;
+  const PLAY_MIN_Y = HUD_SAFE_Y + PLANE_VISUAL_H * 0.5 + 4; // 132
+  const PLAY_MAX_Y = DOCK_SAFE_Y - PLANE_VISUAL_H * 0.5 - 4; // 700
+
+  const PLANE_START_X = 340;
+  const PLANE_START_Y = 416;
+
+  const TARGET_FLAGS = 15;
+  const POINTS_PER_FLAG = 10;
+  const INITIAL_LIVES = 3;
+  const INVULN_DURATION = 1.8; // Çarpışma sonrası >= 1.5 sn kalkan koruması
+  const TRANSITION_DURATION = 1.2; // 5. ve 10. bayrakta sahne geçiş süresi
+  const POST_TRANSITION_SAFE_SECONDS = 2.3; // Geçiş sonrası >= 2 sn güvenli koridor
+  const RESUME_COUNTDOWN_DURATION = 3.0; // 3-2-1 devam hazırlığı
+  const FIXED_DT = 1 / 120; // Sabit fizik alt adımı
+  const MAX_FRAME_DT = 0.1; // Maksimum dt sınırı
+
+  // Zorluk profilleri
+  const DIFFICULTY_MODES = {
+    rahat: {
+      id: 'rahat',
+      label: 'Rahat Uçuş',
+      speeds: [175, 198, 220], // 3 sahne yatay akış hızı (dünya birimi/sn)
+      planeSpeed: 640,
+      corridorBonus: 34, // Daha geniş güvenli koridor
+      segmentGap: 190,
+      minReactionSec: 2.5
+    },
+    kesif: {
+      id: 'kesif',
+      label: 'Keşif Uçuşu',
+      speeds: [205, 232, 258],
+      planeSpeed: 680,
+      corridorBonus: 0,
+      segmentGap: 145,
+      minReactionSec: 2.0
+    }
+  };
+
+  // Üç sahne tanımları
+  const SCENES = [
+    {
+      index: 0,
+      name: '1. Sahne: Bayram Sabahı',
+      shortName: 'Bayram Sabahı',
+      desc: 'Açık mavi gökyüzünde rotanı seç, bayrakları topla!',
+      skyTop: '#1b6ca8',
+      skyMid: '#56b4e9',
+      skyBot: '#dff4ff',
+      sunColor: '#ffd166',
+      sunX: 1290,
+      sunY: 210,
+      hillFar: '#7ec8e3',
+      hillNear: '#4ea8de',
+      cityColor: '#2c5d8a'
+    },
+    {
+      index: 1,
+      name: '2. Sahne: Rüzgâr Rotası',
+      shortName: 'Rüzgâr Rotası',
+      desc: 'Sıcak hava balonları arasından güvenli koridoru takip et!',
+      skyTop: '#16697a',
+      skyMid: '#489fb5',
+      skyBot: '#ede7e3',
+      sunColor: '#ffb703',
+      sunX: 1180,
+      sunY: 235,
+      hillFar: '#68a6b8',
+      hillNear: '#3d7ea6',
+      cityColor: '#234e70'
+    },
+    {
+      index: 2,
+      name: '3. Sahne: Kutlama Meydanına Doğru',
+      shortName: 'Kutlama Meydanına Doğru',
+      desc: 'Altın gün batımında kutlama meydanına yaklaşıyorsun!',
+      skyTop: '#283c63',
+      skyMid: '#c86b85',
+      skyBot: '#f5b971',
+      sunColor: '#ff9f1c',
+      sunX: 1060,
+      sunY: 270,
+      hillFar: '#7c5278',
+      hillNear: '#53354a',
+      cityColor: '#2b2e4a'
+    }
+  ];
+
+  // Durum makinesi izin tablosu
+  const STATE_RULES = {
+    menu: { allowFlightInput: false, runPhysics: false, showHud: false, showDock: false },
+    tutorial: { allowFlightInput: true, runPhysics: true, showHud: true, showDock: true },
+    playing: { allowFlightInput: true, runPhysics: true, showHud: true, showDock: true },
+    paused: { allowFlightInput: false, runPhysics: false, showHud: true, showDock: false },
+    levelTransition: { allowFlightInput: true, runPhysics: false, showHud: true, showDock: true },
+    resumeCountdown: { allowFlightInput: false, runPhysics: false, showHud: true, showDock: true },
+    won: { allowFlightInput: false, runPhysics: false, showHud: false, showDock: false },
+    lost: { allowFlightInput: false, runPhysics: false, showHud: false, showDock: false }
+  };
+
+  // ============================================================================
+  // 2. TOHUMLANABİLİR RASTGELE SAYI ÜRETECİ (Mulberry32)
+  // ============================================================================
+  function createPRNG(seed) {
+    let a = (seed >>> 0) || 19231029;
+    return {
+      next() {
+        a |= 0;
+        a = (a + 0x6d2b79f5) | 0;
+        let t = Math.imul(a ^ (a >>> 15), 1 | a);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+      },
+      range(min, max) {
+        return min + (max - min) * this.next();
+      },
+      int(min, max) {
+        return Math.floor(this.range(min, max + 1));
+      }
+    };
+  }
+
+  function clamp(val, min, max) {
+    return Math.max(min, Math.min(max, val));
+  }
+
+  // ============================================================================
+  // 3. DOĞRULANABİLİR ADİL PARKUR ŞABLONLARI (14 ŞABLON)
+  // ============================================================================
+  // Oyun alanı düşey sınırları: PLAY_MIN_Y = 132, PLAY_MAX_Y = 700 (Orta = 416)
+  // Her şablon:
+  // - entryY ve exitY: güvenli koridorun giriş ve çıkış merkez yükseklikleri
+  // - corridorHalfH: güvenli koridor yarı yüksekliği (toplam genişlik >= 2.5 * 48 = 120; şablonlarda 180..240)
+  // - flag: güvenli koridor içinde yer alan bayrak simgesi
+  // - obstacles: güvenli koridorun DIŞINA yerleştirilmiş engeller
+  const TRACK_TEMPLATES = [
+    {
+      id: 'T01_ust_koridor',
+      stages: [0, 1, 2],
+      length: 520,
+      entryY: 265,
+      exitY: 265,
+      corridorHalfH: 96,
+      flag: { x: 350, y: 265 },
+      obstacles: [
+        { type: 'windCloud', x: 190, y: 545, rX: 62, rY: 42 },
+        { type: 'buoy', x: 340, y: 590, rX: 40, rY: 40 }
+      ]
+    },
+    {
+      id: 'T02_alt_koridor',
+      stages: [0, 1, 2],
+      length: 520,
+      entryY: 555,
+      exitY: 555,
+      corridorHalfH: 96,
+      flag: { x: 350, y: 555 },
+      obstacles: [
+        { type: 'windCloud', x: 190, y: 260, rX: 64, rY: 42 },
+        { type: 'buoy', x: 340, y: 225, rX: 40, rY: 40 }
+      ]
+    },
+    {
+      id: 'T03_orta_gecit',
+      stages: [0, 1, 2],
+      length: 540,
+      entryY: 416,
+      exitY: 416,
+      corridorHalfH: 95,
+      flag: { x: 340, y: 416 },
+      obstacles: [
+        { type: 'windCloud', x: 230, y: 185, rX: 58, rY: 38 },
+        { type: 'buoy', x: 230, y: 640, rX: 40, rY: 40 }
+      ]
+    },
+    {
+      id: 'T04_yukari_tirmanis',
+      stages: [0, 1, 2],
+      length: 540,
+      entryY: 416,
+      exitY: 310,
+      corridorHalfH: 94,
+      flag: { x: 360, y: 310 },
+      obstacles: [
+        { type: 'windCloud', x: 190, y: 600, rX: 58, rY: 38 },
+        { type: 'balloon', x: 340, y: 575, rX: 46, rY: 58, bobAmp: 12 }
+      ]
+    },
+    {
+      id: 'T05_asagi_inis',
+      stages: [0, 1, 2],
+      length: 540,
+      entryY: 340,
+      exitY: 485,
+      corridorHalfH: 94,
+      flag: { x: 360, y: 485 },
+      obstacles: [
+        { type: 'windCloud', x: 190, y: 595, rX: 58, rY: 38 },
+        { type: 'balloon', x: 330, y: 225, rX: 46, rY: 58, bobAmp: 12 }
+      ]
+    },
+    {
+      id: 'T06_balon_turu_ust',
+      stages: [1, 2],
+      length: 560,
+      entryY: 320,
+      exitY: 260,
+      corridorHalfH: 92,
+      flag: { x: 370, y: 260 },
+      obstacles: [
+        { type: 'balloon', x: 200, y: 565, rX: 46, rY: 58, bobAmp: 14 },
+        { type: 'windCloud', x: 350, y: 535, rX: 62, rY: 40 }
+      ]
+    },
+    {
+      id: 'T07_balon_turu_alt',
+      stages: [1, 2],
+      length: 560,
+      entryY: 490,
+      exitY: 560,
+      corridorHalfH: 92,
+      flag: { x: 370, y: 560 },
+      obstacles: [
+        { type: 'balloon', x: 200, y: 245, rX: 46, rY: 58, bobAmp: 14 },
+        { type: 'windCloud', x: 350, y: 280, rX: 62, rY: 40 }
+      ]
+    },
+    {
+      id: 'T08_samandira_kapisi',
+      stages: [0, 1, 2],
+      length: 540,
+      entryY: 355,
+      exitY: 355,
+      corridorHalfH: 94,
+      flag: { x: 350, y: 355 },
+      obstacles: [
+        { type: 'buoy', x: 210, y: 595, rX: 42, rY: 42 },
+        { type: 'windCloud', x: 350, y: 585, rX: 60, rY: 40 }
+      ]
+    },
+    {
+      id: 'T09_capraz_koridor_yukari',
+      stages: [1, 2],
+      length: 560,
+      entryY: 495,
+      exitY: 365,
+      corridorHalfH: 92,
+      flag: { x: 370, y: 365 },
+      obstacles: [
+        { type: 'buoy', x: 185, y: 235, rX: 40, rY: 40 },
+        { type: 'windCloud', x: 350, y: 600, rX: 62, rY: 40 }
+      ]
+    },
+    {
+      id: 'T10_capraz_koridor_asagi',
+      stages: [1, 2],
+      length: 560,
+      entryY: 340,
+      exitY: 475,
+      corridorHalfH: 92,
+      flag: { x: 370, y: 475 },
+      obstacles: [
+        { type: 'buoy', x: 185, y: 590, rX: 40, rY: 40 },
+        { type: 'windCloud', x: 350, y: 225, rX: 62, rY: 40 }
+      ]
+    },
+    {
+      id: 'T11_kutlama_yaklasimi_ust',
+      stages: [2],
+      length: 580,
+      entryY: 315,
+      exitY: 295,
+      corridorHalfH: 92,
+      flag: { x: 380, y: 295 },
+      obstacles: [
+        { type: 'balloon', x: 180, y: 560, rX: 46, rY: 58, bobAmp: 12 },
+        { type: 'buoy', x: 290, y: 575, rX: 40, rY: 40 },
+        { type: 'windCloud', x: 390, y: 580, rX: 60, rY: 40 }
+      ]
+    },
+    {
+      id: 'T12_kutlama_yaklasimi_alt',
+      stages: [2],
+      length: 580,
+      entryY: 505,
+      exitY: 530,
+      corridorHalfH: 92,
+      flag: { x: 380, y: 530 },
+      obstacles: [
+        { type: 'balloon', x: 180, y: 250, rX: 46, rY: 58, bobAmp: 12 },
+        { type: 'buoy', x: 290, y: 235, rX: 40, rY: 40 },
+        { type: 'windCloud', x: 390, y: 230, rX: 60, rY: 40 }
+      ]
+    },
+    {
+      id: 'T13_genis_bayram_rotasi',
+      stages: [0, 1, 2],
+      length: 520,
+      entryY: 465,
+      exitY: 475,
+      corridorHalfH: 98,
+      flag: { x: 330, y: 475 },
+      obstacles: [
+        { type: 'windCloud', x: 250, y: 215, rX: 60, rY: 38 }
+      ]
+    },
+    {
+      id: 'T14_yuksek_bulut_gecidi',
+      stages: [0, 1, 2],
+      length: 520,
+      entryY: 330,
+      exitY: 315,
+      corridorHalfH: 98,
+      flag: { x: 330, y: 315 },
+      obstacles: [
+        { type: 'windCloud', x: 250, y: 600, rX: 60, rY: 38 }
+      ]
+    }
+  ];
+
+  // İlk 8-10 saniye için özel başlangıç parçası (kolay ilk bayrak, çok seyrek engel)
+  const OPENING_TEMPLATE = {
+    id: 'T00_acilis_merhaba',
+    stages: [0],
+    length: 500,
+    entryY: 416,
+    exitY: 395,
+    corridorHalfH: 120,
+    flag: { x: 260, y: 395 },
+    obstacles: [
+      { type: 'windCloud', x: 240, y: 620, rX: 58, rY: 38 }
+    ]
+  };
+
+  // Güvenli yedek şablon
+  const SAFE_FALLBACK_TEMPLATE = {
+    id: 'T99_guvenli_yedek',
+    stages: [0, 1, 2],
+    length: 500,
+    entryY: 416,
+    exitY: 416,
+    corridorHalfH: 115,
+    flag: { x: 300, y: 330 },
+    obstacles: [
+      { type: 'buoy', x: 240, y: 610, rX: 38, rY: 38 }
+    ]
+  };
+
+  /**
+   * İki ardışık parkur parçası arasındaki düşey geçişin,
+   * yatay hız, aralık ve uçağın düşey hızına göre aşılabilir olduğunu doğrular.
+   */
+  function validateSegmentTransition(prevExitY, candidate, modeCfg, stageIdx, lastFlagY) {
+    const scrollSpeed = modeCfg.speeds[stageIdx] || modeCfg.speeds[0];
+    const corridorHalf = candidate.corridorHalfH + modeCfg.corridorBonus;
+    const minCorridorRequired = PLANE_HITBOX_H * 2.5; // >= 120 dünya birimi
+    if (corridorHalf * 2 < minCorridorRequired) {
+      return { valid: false, reason: 'corridor_too_narrow' };
+    }
+
+    // Parçalar arası yatay mesafe + giriş toleransı
+    const horizontalTravel = modeCfg.segmentGap + candidate.flag.x;
+    const timeAvailable = horizontalTravel / scrollSpeed;
+    const deltaY = Math.abs(candidate.entryY - prevExitY);
+    const maxSafeVerticalReach = Math.min(185, modeCfg.planeSpeed * timeAvailable * 0.45);
+
+    if (deltaY > maxSafeVerticalReach) {
+      return { valid: false, reason: 'vertical_transition_too_steep' };
+    }
+
+    // Aynı yükseklikte sürekli bayrak üretimini önle (hareketsiz kazanmayı engeller)
+    if (typeof lastFlagY === 'number' && Math.abs(candidate.flag.y - lastFlagY) < 48) {
+      return { valid: false, reason: 'same_flag_height' };
+    }
+
+    // Bayrak ile şablondaki tüm engeller arasında güvenli mesafe kontrolü
+    for (let i = 0; i < candidate.obstacles.length; i++) {
+      const ob = candidate.obstacles[i];
+      const dx = Math.abs(candidate.flag.x - ob.x);
+      const dy = Math.abs(candidate.flag.y - ob.y) - (ob.bobAmp || 0);
+      const minClearX = ob.rX + PLANE_HITBOX_W * 0.65;
+      const minClearY = ob.rY + PLANE_HITBOX_H * 0.85;
+      if (dx < minClearX && dy < minClearY) {
+        return { valid: false, reason: 'flag_obstacle_overlap' };
+      }
+    }
+
+    return {
+      valid: true,
+      corridorWidth: corridorHalf * 2,
+      timeAvailable,
+      deltaY,
+      maxSafeVerticalReach
+    };
+  }
+
+  // ============================================================================
+  // 4. TÜRK BAYRAĞI VEKTÖREL ÇİZİM FONKSİYONU (Türk Bayrağı Tüzüğü Oranları)
+  // ============================================================================
+  /**
+   * Türk bayrağını doğru yön ve geometriyle, kırmızı zemin, beyaz hilal ve
+   * beyaz beş köşeli yıldızla vektörel olarak çizer.
+   *
+   * @param {CanvasRenderingContext2D} ctx
+   * @param {number} x - Sol üst köşe X (veya center=true ise merkez X)
+   * @param {number} y - Sol üst köşe Y (veya center=true ise merkez Y)
+   * @param {number} width - Bayrak genişliği (L = 1.5 * G)
+   * @param {Object} opts - { centered, wavePhase, borderRadius, showPole }
+   */
+  function drawTurkishFlag(ctx, x, y, width, opts = {}) {
+    const L = width;
+    const G = L / 1.5; // Bayrak yüksekliği (En)
+    const left = opts.centered ? x - L * 0.5 : x;
+    const top = opts.centered ? y - G * 0.5 : y;
+    const wave = opts.wavePhase ? Math.sin(opts.wavePhase) * (G * 0.025) : 0;
+
+    ctx.save();
+    ctx.translate(left, top + wave);
+
+    // Hafif gölge ve çerçeve
+    const radius = opts.borderRadius !== undefined ? opts.borderRadius : Math.max(3, G * 0.08);
+    ctx.beginPath();
+    if (ctx.roundRect) {
+      ctx.roundRect(0, 0, L, G, radius);
+    } else {
+      ctx.rect(0, 0, L, G);
+    }
+    ctx.fillStyle = '#E30A17'; // Resmi Türk Bayrağı Kırmızısı
+    ctx.fill();
+
+    // Kırpma alanı (Hilal ve yıldız bayrak içinde kalsın)
+    ctx.clip();
+
+    // Hafif kumaş parlaklığı (sembolü bozmaz)
+    const sheen = ctx.createLinearGradient(0, 0, L, G);
+    sheen.addColorStop(0, 'rgba(255, 255, 255, 0.10)');
+    sheen.addColorStop(0.5, 'rgba(255, 255, 255, 0.0)');
+    sheen.addColorStop(1, 'rgba(0, 0, 0, 0.08)');
+    ctx.fillStyle = sheen;
+    ctx.fillRect(0, 0, L, G);
+
+    // 1. Beyaz Dış Hilal Çemberi: Merkez (0.5 * G, 0.5 * G), Çap = 0.5 * G (R1 = 0.25 * G)
+    const outerCx = 0.5 * G;
+    const outerCy = 0.5 * G;
+    const outerR = 0.25 * G;
+
+    ctx.fillStyle = '#FFFFFF';
+    ctx.beginPath();
+    ctx.arc(outerCx, outerCy, outerR, 0, Math.PI * 2);
+    ctx.fill();
+
+    // 2. Kırmızı İç Hilal Çemberi: Merkez (0.5625 * G, 0.5 * G), Çap = 0.4 * G (R2 = 0.20 * G)
+    const innerCx = 0.5625 * G;
+    const innerCy = 0.5 * G;
+    const innerR = 0.20 * G;
+
+    ctx.fillStyle = '#E30A17';
+    ctx.beginPath();
+    ctx.arc(innerCx, innerCy, innerR, 0, Math.PI * 2);
+    ctx.fill();
+
+    // 3. Beyaz Beş Köşeli Yıldız:
+    // Merkez: x = (0.5625 - 0.20 + 1/3 + 0.125) * G = 0.82083 * G, y = 0.5 * G
+    // Dış yarıçap Rs = 0.125 * G, bir ucu sola (hilalin merkezine doğru, Math.PI açısına) bakar
+    const starCx = 0.820833 * G;
+    const starCy = 0.5 * G;
+    const starOuterR = 0.125 * G;
+    const starInnerR = starOuterR * 0.381966; // Tam geometrik 5 köşeli yıldız iç yarıçap oranı
+
+    ctx.fillStyle = '#FFFFFF';
+    ctx.beginPath();
+    for (let i = 0; i < 10; i++) {
+      const angle = Math.PI + (i * Math.PI) / 5; // İlk tepe noktası sola (Math.PI) bakar
+      const r = i % 2 === 0 ? starOuterR : starInnerR;
+      const sx = starCx + Math.cos(angle) * r;
+      const sy = starCy + Math.sin(angle) * r;
+      if (i === 0) {
+        ctx.moveTo(sx, sy);
+      } else {
+        ctx.lineTo(sx, sy);
+      }
+    }
+    ctx.closePath();
+    ctx.fill();
+
+    // İnce beyaz/altın çerçeve konturu
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.75)';
+    ctx.lineWidth = Math.max(1.5, G * 0.03);
+    ctx.strokeRect(0, 0, L, G);
+
+    ctx.restore();
+  }
+
+  // ============================================================================
+  // 5. WEB AUDIO API SES SENTEZLEYİCİ (Harici Dosya Gerektirmez)
+  // ============================================================================
+  class SoundEngine {
+    constructor() {
+      this.enabled = false; // Varsayılan kapalı
+      this.ctx = null;
+      this.activeNodes = new Set();
+      this.userInteracted = false;
+    }
+
+    markInteraction() {
+      this.userInteracted = true;
+    }
+
+    ensureContext() {
+      if (!this.enabled || !this.userInteracted) return null;
+      if (!this.ctx) {
+        const AudioCtx = window.AudioContext || window.webkitAudioContext;
+        if (!AudioCtx) return null;
+        try {
+          this.ctx = new AudioCtx();
+        } catch (e) {
+          return null;
+        }
+      }
+      if (this.ctx && this.ctx.state === 'suspended') {
+        try {
+          this.ctx.resume();
+        } catch (e) {
+          // Yoksay
+        }
+      }
+      return this.ctx;
+    }
+
+    setEnabled(val) {
+      this.enabled = Boolean(val);
+      if (!this.enabled) {
+        this.stopAll();
+      } else {
+        this.ensureContext();
+      }
+    }
+
+    stopAll() {
+      this.activeNodes.forEach((node) => {
+        try {
+          node.stop();
+          node.disconnect();
+        } catch (e) {
+          // Zaten durmuş olabilir
+        }
+      });
+      this.activeNodes.clear();
+    }
+
+    playTone(freq, duration, type = 'sine', gainVal = 0.14, delaySec = 0) {
+      const ctx = this.ensureContext();
+      if (!ctx) return;
+      try {
+        const now = ctx.currentTime + delaySec;
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = type;
+        osc.frequency.setValueAtTime(freq, now);
+
+        gain.gain.setValueAtTime(0.0001, now);
+        gain.gain.exponentialRampToValueAtTime(gainVal, now + 0.015);
+        gain.gain.exponentialRampToValueAtTime(0.0001, now + duration);
+
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+
+        this.activeNodes.add(osc);
+        osc.onended = () => {
+          this.activeNodes.delete(osc);
+          try {
+            osc.disconnect();
+            gain.disconnect();
+          } catch (e) {}
+        };
+
+        osc.start(now);
+        osc.stop(now + duration + 0.02);
+      } catch (e) {
+        // Ses hatası oyunu kesmez
+      }
+    }
+
+    playCollect() {
+      this.playTone(587.33, 0.11, 'triangle', 0.15, 0); // D5
+      this.playTone(880.0, 0.18, 'triangle', 0.16, 0.07); // A5
+    }
+
+    playHit() {
+      this.playTone(240, 0.16, 'sine', 0.16, 0);
+      this.playTone(185, 0.22, 'triangle', 0.14, 0.09);
+    }
+
+    playTransition() {
+      this.playTone(523.25, 0.12, 'triangle', 0.14, 0); // C5
+      this.playTone(659.25, 0.12, 'triangle', 0.14, 0.09); // E5
+      this.playTone(783.99, 0.22, 'triangle', 0.15, 0.18); // G5
+    }
+
+    playWin() {
+      const notes = [523.25, 659.25, 783.99, 1046.5];
+      notes.forEach((n, idx) => {
+        this.playTone(n, 0.22, 'triangle', 0.15, idx * 0.11);
+      });
+    }
+  }
+
+  // ============================================================================
+  // 6. ANA OYUN MOTORU SINIFI
+  // ============================================================================
+  class GokyuzuGoreviGame {
+    constructor() {
+      this.canvas = document.getElementById('game-canvas');
+      this.ctx = this.canvas ? this.canvas.getContext('2d') : null;
+      this.sound = new SoundEngine();
+
+      // Azaltılmış hareket tercihi
+      this.reducedMotion = Boolean(
+        window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches
+      );
+
+      // Durum ve mod
+      this.state = 'menu';
+      this.difficulty = 'rahat';
+      this.seed = 20231029;
+      this.rng = createPRNG(this.seed);
+      this.tutorialCompletedOnce = false;
+
+      // Simülasyon zamanı ve döngü kontrolü
+      this.simTime = 0;
+      this.menuAnimTime = 0;
+      this.lastFrameTime = 0;
+      this.accumulator = 0;
+      this.rafId = null;
+      this.loopStartCount = 0; // Tek RAF döngüsü doğrulaması için
+
+      // Oyun içi sayaçlar
+      this.flags = 0;
+      this.score = 0;
+      this.lives = INITIAL_LIVES;
+      this.sceneIndex = 0;
+      this.transitionTimer = 0;
+      this.countdownTimer = 0;
+      this.winGlideTimer = 0;
+
+      // Uçak durumu
+      this.plane = {
+        x: PLANE_START_X,
+        y: PLANE_START_Y,
+        targetX: PLANE_START_X,
+        targetY: PLANE_START_Y,
+        vx: 0,
+        vy: 0,
+        bankAngle: 0,
+        propAngle: 0,
+        invulnTimer: 0,
+        damagedByIds: new Set(),
+        hitFlashTimer: 0
+      };
+
+      // Giriş (Input) yönetimi — En son kullanılan yöntemi önceliklendirir
+      this.input = {
+        lastMethod: 'none', // 'pad' | 'drag' | 'dpad' | 'keyboard'
+        keys: new Set(),
+        dpadDirs: new Set(),
+        dpadPointers: new Map(),
+        padPointerId: null,
+        padLastWorld: null,
+        dragPointerId: null,
+        dragOffsetX: 0,
+        dragOffsetY: 0
+      };
+
+      // Nesne havuzları ve sahne listeleri
+      this.nextEntityId = 1;
+      this.flagItems = [];
+      this.obstacles = [];
+      this.particles = []; // Üst sınır: 60
+      this.floatingTexts = []; // Üst sınır: 5
+      this.confetti = []; // Yalnızca finalde kısa süreli, üst sınır: 70
+
+      // Parkur üretim durumu
+      this.spawner = {
+        nextSpawnX: 920,
+        lastExitY: PLANE_START_Y,
+        lastFlagY: PLANE_START_Y,
+        segmentCount: 0,
+        lastTemplateId: ''
+      };
+
+      // Eğitim (Tutorial) durumu
+      this.tutorial = {
+        step: 1, // 1: Halka, 2: Bayrak, 3: Engel ve güvenli geçit, 4: Tamamlandı
+        ring: { x: 720, y: 270, r: 58, progress: 0 },
+        flagSpawned: false,
+        obstacleSpawned: false,
+        safeGateX: 0
+      };
+
+      // Arka plan dekoratif bulut ve şehir katmanları
+      this.bgLayers = {
+        farScroll: 0,
+        midScroll: 0,
+        cityScroll: 0,
+        decoClouds: [
+          { x: 180, y: 170, scale: 1.0, speedMul: 0.22 },
+          { x: 560, y: 240, scale: 0.85, speedMul: 0.18 },
+          { x: 980, y: 155, scale: 1.15, speedMul: 0.25 },
+          { x: 1380, y: 225, scale: 0.9, speedMul: 0.20 },
+          { x: 760, y: 340, scale: 0.75, speedMul: 0.15 }
+        ]
+      };
+
+      // HUD önbelleği (DOM yalnızca değer değiştiğinde güncellenir)
+      this.hudCache = {
+        flags: -1,
+        score: -1,
+        lives: -1,
+        sceneIndex: -1,
+        soundEnabled: null
+      };
+
+      this.pendingConfirmAction = null;
+      this.toastTimer = 0;
+
+      this.cacheDom();
+      this.loadPreferences();
+      this.bindEvents();
+      this.resizeCanvas();
+      this.syncUiForState();
+      this.startLoop();
+    }
+
+    // --------------------------------------------------------------------------
+    // DOM ÖĞELERİ VE YEREL TERCİHLER
+    // --------------------------------------------------------------------------
+    cacheDom() {
+      this.dom = {
+        stageWrapper: document.getElementById('stage-wrapper'),
+        hudBar: document.getElementById('hud-bar'),
+        hudFlagText: document.getElementById('hud-flag-text'),
+        hudScoreText: document.getElementById('hud-score-text'),
+        hudHearts: document.getElementById('hud-hearts'),
+        hudLivesText: document.getElementById('hud-lives-text'),
+        hudSceneBadge: document.getElementById('hud-scene-badge'),
+        hudSoundBtn: document.getElementById('hud-sound-btn'),
+        hudSoundIcon: document.getElementById('hud-sound-icon'),
+        hudSoundLabel: document.getElementById('hud-sound-label'),
+        hudFullscreenBtn: document.getElementById('hud-fullscreen-btn'),
+        hudPauseBtn: document.getElementById('hud-pause-btn'),
+
+        toastBanner: document.getElementById('toast-banner'),
+        tutorialPanel: document.getElementById('tutorial-panel'),
+        tutorialStepBadge: document.getElementById('tutorial-step-badge'),
+        tutorialInstruction: document.getElementById('tutorial-instruction'),
+        tutorialReadyBtn: document.getElementById('tutorial-ready-btn'),
+        tutorialSkipBtn: document.getElementById('tutorial-skip-btn'),
+
+        transitionOverlay: document.getElementById('transition-overlay'),
+        transitionTitle: document.getElementById('transition-title'),
+        transitionDesc: document.getElementById('transition-desc'),
+
+        countdownOverlay: document.getElementById('countdown-overlay'),
+        countdownNumber: document.getElementById('countdown-number'),
+        countdownCancelBtn: document.getElementById('countdown-cancel-btn'),
+
+        menuScreen: document.getElementById('menu-screen'),
+        modeRahatBtn: document.getElementById('mode-rahat-btn'),
+        modeKesifBtn: document.getElementById('mode-kesif-btn'),
+        startFlightBtn: document.getElementById('start-flight-btn'),
+        startTutorialBtn: document.getElementById('start-tutorial-btn'),
+        howToPlayBtn: document.getElementById('how-to-play-btn'),
+        menuSoundBtn: document.getElementById('menu-sound-btn'),
+        menuSoundIcon: document.getElementById('menu-sound-icon'),
+        menuSoundLabel: document.getElementById('menu-sound-label'),
+        menuFullscreenBtn: document.getElementById('menu-fullscreen-btn'),
+
+        howtoModal: document.getElementById('howto-modal'),
+        howtoTutorialBtn: document.getElementById('howto-tutorial-btn'),
+        howtoCloseBtn: document.getElementById('howto-close-btn'),
+
+        pauseScreen: document.getElementById('pause-screen'),
+        pauseStatusText: document.getElementById('pause-status-text'),
+        pauseMainButtons: document.getElementById('pause-main-buttons'),
+        resumeBtn: document.getElementById('resume-btn'),
+        pauseRestartBtn: document.getElementById('pause-restart-btn'),
+        pauseMenuBtn: document.getElementById('pause-menu-btn'),
+        pauseConfirmBox: document.getElementById('pause-confirm-box'),
+        confirmMsg: document.getElementById('confirm-msg'),
+        confirmYesBtn: document.getElementById('confirm-yes-btn'),
+        confirmCancelBtn: document.getElementById('confirm-cancel-btn'),
+
+        winScreen: document.getElementById('win-screen'),
+        winFlagsVal: document.getElementById('win-flags-val'),
+        winScoreVal: document.getElementById('win-score-val'),
+        winLivesVal: document.getElementById('win-lives-val'),
+        winReplayBtn: document.getElementById('win-replay-btn'),
+        winMenuBtn: document.getElementById('win-menu-btn'),
+
+        lostScreen: document.getElementById('lost-screen'),
+        lostFlagsVal: document.getElementById('lost-flags-val'),
+        lostScoreVal: document.getElementById('lost-score-val'),
+        lostRetryBtn: document.getElementById('lost-retry-btn'),
+        lostMenuBtn: document.getElementById('lost-menu-btn'),
+
+        controlDock: document.getElementById('control-dock'),
+        relativeTouchPad: document.getElementById('relative-touch-pad'),
+        touchPadRipple: document.getElementById('touch-pad-ripple'),
+        dpadBtns: Array.from(document.querySelectorAll('.dpad-btn'))
+      };
+    }
+
+    loadPreferences() {
+      try {
+        const savedDiff = localStorage.getItem('gokyuzu_difficulty');
+        if (savedDiff === 'rahat' || savedDiff === 'kesif') {
+          this.difficulty = savedDiff;
+        }
+        const savedTut = localStorage.getItem('gokyuzu_tutorial_done');
+        if (savedTut === '1') {
+          this.tutorialCompletedOnce = true;
+        }
+      } catch (e) {
+        // Depolama kapalıysa sessizce devam et
+      }
+      this.updateDifficultyButtons();
+      this.updateSoundButtons();
+    }
+
+    savePreference(key, val) {
+      try {
+        localStorage.setItem(key, val);
+      } catch (e) {
+        // Depolama kapalıysa çökme
+      }
+    }
+
+    // --------------------------------------------------------------------------
+    // EKRAN ÖLÇEKLEME VE DÜNYA KOORDİNAT DÖNÜŞÜMÜ
+    // --------------------------------------------------------------------------
+    resizeCanvas() {
+      if (!this.canvas || !this.ctx) return;
+      const dpr = clamp(window.devicePixelRatio || 1, 1, 2);
+      const rect = this.canvas.getBoundingClientRect();
+      const targetW = Math.max(320, Math.round((rect.width || WORLD_W) * dpr));
+      const targetH = Math.max(180, Math.round((rect.height || WORLD_H) * dpr));
+
+      if (this.canvas.width !== targetW || this.canvas.height !== targetH) {
+        this.canvas.width = targetW;
+        this.canvas.height = targetH;
+      }
+
+      // Uçağın konumunu her zaman güvenli sınırlarda tut
+      this.plane.x = clamp(this.plane.x, PLAY_MIN_X, PLAY_MAX_X);
+      this.plane.y = clamp(this.plane.y, PLAY_MIN_Y, PLAY_MAX_Y);
+      this.plane.targetX = clamp(this.plane.targetX, PLAY_MIN_X, PLAY_MAX_X);
+      this.plane.targetY = clamp(this.plane.targetY, PLAY_MIN_Y, PLAY_MAX_Y);
+    }
+
+    /**
+     * İstemci (clientX, clientY) koordinatlarını canvas bounding rect ve ölçeğe göre
+     * 1600x900 mantıksal dünya koordinatına çevirir.
+     */
+    clientToWorld(clientX, clientY) {
+      if (!this.canvas) return { x: PLANE_START_X, y: PLANE_START_Y, scaleX: 1, scaleY: 1 };
+      const rect = this.canvas.getBoundingClientRect();
+      const w = rect.width || WORLD_W;
+      const h = rect.height || WORLD_H;
+      const scaleX = WORLD_W / w;
+      const scaleY = WORLD_H / h;
+      return {
+        x: (clientX - rect.left) * scaleX,
+        y: (clientY - rect.top) * scaleY,
+        scaleX,
+        scaleY
+      };
+    }
+
+    // --------------------------------------------------------------------------
+    // OLAY DİNLEYİCİLERİ VE 3 KONTROL YÖNTEMİ
+    // --------------------------------------------------------------------------
+    bindEvents() {
+      window.addEventListener('resize', () => {
+        this.resizeCanvas();
+      });
+
+      window.addEventListener('blur', () => {
+        this.clearAllInputs();
+        if (this.state === 'playing' || this.state === 'tutorial' || this.state === 'resumeCountdown') {
+          this.pauseGame();
+        }
+      });
+
+      document.addEventListener('visibilitychange', () => {
+        if (document.hidden) {
+          this.clearAllInputs();
+          if (this.state === 'playing' || this.state === 'tutorial' || this.state === 'resumeCountdown') {
+            this.pauseGame();
+          }
+        }
+      });
+
+      // İlk etkileşimde ses motorunu bilgilendir
+      const markUserGesture = () => this.sound.markInteraction();
+      window.addEventListener('pointerdown', markUserGesture, { passive: true });
+      window.addEventListener('keydown', markUserGesture, { passive: true });
+
+      // Menü ve Arayüz Düğmeleri
+      if (this.dom.modeRahatBtn) {
+        this.dom.modeRahatBtn.addEventListener('click', () => this.setDifficulty('rahat'));
+      }
+      if (this.dom.modeKesifBtn) {
+        this.dom.modeKesifBtn.addEventListener('click', () => this.setDifficulty('kesif'));
+      }
+      if (this.dom.startFlightBtn) {
+        this.dom.startFlightBtn.addEventListener('click', () => {
+          if (!this.tutorialCompletedOnce) {
+            this.startTutorial();
+          } else {
+            this.startNewGame();
+          }
+        });
+      }
+      if (this.dom.startTutorialBtn) {
+        this.dom.startTutorialBtn.addEventListener('click', () => this.startTutorial());
+      }
+      if (this.dom.howToPlayBtn) {
+        this.dom.howToPlayBtn.addEventListener('click', () => {
+          this.dom.howtoModal.classList.remove('hidden');
+        });
+      }
+      if (this.dom.howtoCloseBtn) {
+        this.dom.howtoCloseBtn.addEventListener('click', () => {
+          this.dom.howtoModal.classList.add('hidden');
+        });
+      }
+      if (this.dom.howtoTutorialBtn) {
+        this.dom.howtoTutorialBtn.addEventListener('click', () => {
+          this.dom.howtoModal.classList.add('hidden');
+          this.startTutorial();
+        });
+      }
+
+      // Ses ve Tam ekran düğmeleri
+      const toggleSoundHandler = () => {
+        this.sound.markInteraction();
+        this.sound.setEnabled(!this.sound.enabled);
+        this.updateSoundButtons();
+      };
+      if (this.dom.menuSoundBtn) this.dom.menuSoundBtn.addEventListener('click', toggleSoundHandler);
+      if (this.dom.hudSoundBtn) this.dom.hudSoundBtn.addEventListener('click', toggleSoundHandler);
+
+      const toggleFsHandler = () => this.toggleFullscreen();
+      if (this.dom.menuFullscreenBtn) this.dom.menuFullscreenBtn.addEventListener('click', toggleFsHandler);
+      if (this.dom.hudFullscreenBtn) this.dom.hudFullscreenBtn.addEventListener('click', toggleFsHandler);
+
+      // Eğitim Uçuşu düğmeleri
+      if (this.dom.tutorialSkipBtn) {
+        this.dom.tutorialSkipBtn.addEventListener('click', () => {
+          this.tutorialCompletedOnce = true;
+          this.savePreference('gokyuzu_tutorial_done', '1');
+          this.startNewGame();
+        });
+      }
+      if (this.dom.tutorialReadyBtn) {
+        this.dom.tutorialReadyBtn.addEventListener('click', () => {
+          this.tutorialCompletedOnce = true;
+          this.savePreference('gokyuzu_tutorial_done', '1');
+          this.startNewGame();
+        });
+      }
+
+      // Duraklatma ve Geri Sayım düğmeleri
+      if (this.dom.hudPauseBtn) {
+        this.dom.hudPauseBtn.addEventListener('click', () => {
+          if (this.state === 'playing' || this.state === 'tutorial' || this.state === 'resumeCountdown') {
+            this.pauseGame();
+          }
+        });
+      }
+      if (this.dom.resumeBtn) {
+        this.dom.resumeBtn.addEventListener('click', () => this.startResumeCountdown());
+      }
+      if (this.dom.countdownCancelBtn) {
+        this.dom.countdownCancelBtn.addEventListener('click', () => this.pauseGame());
+      }
+      if (this.dom.pauseRestartBtn) {
+        this.dom.pauseRestartBtn.addEventListener('click', () => {
+          this.askPauseConfirm('restart', 'Mevcut uçuş sıfırlanıp yeniden başlatılsın mı?');
+        });
+      }
+      if (this.dom.pauseMenuBtn) {
+        this.dom.pauseMenuBtn.addEventListener('click', () => {
+          this.askPauseConfirm('menu', 'Mevcut uçuş sonlandırılıp ana menüye dönülsün mü?');
+        });
+      }
+      if (this.dom.confirmYesBtn) {
+        this.dom.confirmYesBtn.addEventListener('click', () => {
+          const action = this.pendingConfirmAction;
+          this.pendingConfirmAction = null;
+          if (action === 'restart') {
+            this.startNewGame();
+          } else if (action === 'menu') {
+            this.goToMenu();
+          }
+        });
+      }
+      if (this.dom.confirmCancelBtn) {
+        this.dom.confirmCancelBtn.addEventListener('click', () => {
+          this.pendingConfirmAction = null;
+          this.dom.pauseConfirmBox.classList.add('hidden');
+          this.dom.pauseMainButtons.classList.remove('hidden');
+        });
+      }
+
+      // Başarı ve Uçuş Sonu düğmeleri
+      if (this.dom.winReplayBtn) {
+        this.dom.winReplayBtn.addEventListener('click', () => this.startNewGame());
+      }
+      if (this.dom.winMenuBtn) {
+        this.dom.winMenuBtn.addEventListener('click', () => this.goToMenu());
+      }
+      if (this.dom.lostRetryBtn) {
+        this.dom.lostRetryBtn.addEventListener('click', () => this.startNewGame());
+      }
+      if (this.dom.lostMenuBtn) {
+        this.dom.lostMenuBtn.addEventListener('click', () => this.goToMenu());
+      }
+
+      // KONTROL A: Göreli Dokunmatik Kontrol Paneli (Akıllı Tahta Ana Yöntemi)
+      this.bindRelativeTouchPad();
+
+      // KONTROL B: Doğrudan Uçak Sürükleme (Canvas üzerinde)
+      this.bindDirectCanvasDrag();
+
+      // KONTROL C: Büyük Yön Düğmeleri ve Klavye
+      this.bindDpadAndKeyboard();
+    }
+
+    bindRelativeTouchPad() {
+      const pad = this.dom.relativeTouchPad;
+      if (!pad) return;
+
+      // Göreli duyarlılık: paneldeki hareket farkını kontrollü biçimde uçağa aktarır
+      const RELATIVE_SENSITIVITY_X = 1.35;
+      const RELATIVE_SENSITIVITY_Y = 1.65;
+
+      pad.addEventListener('pointerdown', (e) => {
+        if (!STATE_RULES[this.state]?.allowFlightInput) return;
+        // Tek işaretçi kimliği takip et; ikinci parmak uçağı kaçırmasın
+        if (this.input.padPointerId !== null) return;
+
+        e.preventDefault();
+        this.input.padPointerId = e.pointerId;
+        this.input.lastMethod = 'pad';
+        const wPt = this.clientToWorld(e.clientX, e.clientY);
+        this.input.padLastWorld = { x: wPt.x, y: wPt.y };
+
+        // İlk dokunmada uçak parmak noktasına ışınlanmaz; mevcut konumunu korur
+        this.plane.targetX = this.plane.x;
+        this.plane.targetY = this.plane.y;
+
+        try {
+          pad.setPointerCapture(e.pointerId);
+        } catch (err) {}
+
+        pad.classList.add('active-pad');
+        this.updatePadRipple(e.clientX, e.clientY, true);
+      });
+
+      pad.addEventListener('pointermove', (e) => {
+        if (e.pointerId !== this.input.padPointerId) return;
+        if (!STATE_RULES[this.state]?.allowFlightInput) return;
+
+        e.preventDefault();
+        const wPt = this.clientToWorld(e.clientX, e.clientY);
+        if (this.input.padLastWorld) {
+          const dx = (wPt.x - this.input.padLastWorld.x) * RELATIVE_SENSITIVITY_X;
+          const dy = (wPt.y - this.input.padLastWorld.y) * RELATIVE_SENSITIVITY_Y;
+
+          this.plane.targetX = clamp(this.plane.targetX + dx, PLAY_MIN_X, PLAY_MAX_X);
+          this.plane.targetY = clamp(this.plane.targetY + dy, PLAY_MIN_Y, PLAY_MAX_Y);
+        }
+        this.input.padLastWorld = { x: wPt.x, y: wPt.y };
+        this.input.lastMethod = 'pad';
+        this.updatePadRipple(e.clientX, e.clientY, true);
+      });
+
+      const releasePad = (e) => {
+        if (e.pointerId !== this.input.padPointerId) return;
+        this.input.padPointerId = null;
+        this.input.padLastWorld = null;
+        // Parmak kaldırılınca uçak son konumunda güvenle kalır
+        this.plane.targetX = this.plane.x;
+        this.plane.targetY = this.plane.y;
+        pad.classList.remove('active-pad');
+        this.updatePadRipple(0, 0, false);
+      };
+
+      pad.addEventListener('pointerup', releasePad);
+      pad.addEventListener('pointercancel', releasePad);
+      pad.addEventListener('lostpointercapture', releasePad);
+    }
+
+    updatePadRipple(clientX, clientY, visible) {
+      const ripple = this.dom.touchPadRipple;
+      const pad = this.dom.relativeTouchPad;
+      if (!ripple || !pad) return;
+      if (!visible) {
+        ripple.classList.add('hidden');
+        return;
+      }
+      const rect = pad.getBoundingClientRect();
+      ripple.style.left = `${clientX - rect.left}px`;
+      ripple.style.top = `${clientY - rect.top}px`;
+      ripple.classList.remove('hidden');
+    }
+
+    bindDirectCanvasDrag() {
+      const canvas = this.canvas;
+      if (!canvas) return;
+
+      canvas.addEventListener('pointerdown', (e) => {
+        if (!STATE_RULES[this.state]?.allowFlightInput) return;
+        if (this.input.dragPointerId !== null) return;
+
+        const wPt = this.clientToWorld(e.clientX, e.clientY);
+        // Uçağın etrafındaki geniş görünmez yakalama alanı kontrolü
+        const dx = Math.abs(wPt.x - this.plane.x);
+        const dy = Math.abs(wPt.y - this.plane.y);
+        if (dx > PLANE_GRAB_HALF_W || dy > PLANE_GRAB_HALF_H) {
+          // Uçak dışındaki yere tıklamak aniden o noktaya taşımaz!
+          return;
+        }
+
+        e.preventDefault();
+        this.input.dragPointerId = e.pointerId;
+        this.input.lastMethod = 'drag';
+        // Dokunma ofsetini koru, basınca uçak zıplamasın
+        this.input.dragOffsetX = this.plane.x - wPt.x;
+        this.input.dragOffsetY = this.plane.y - wPt.y;
+        this.plane.targetX = this.plane.x;
+        this.plane.targetY = this.plane.y;
+
+        try {
+          canvas.setPointerCapture(e.pointerId);
+        } catch (err) {}
+      });
+
+      canvas.addEventListener('pointermove', (e) => {
+        if (e.pointerId !== this.input.dragPointerId) return;
+        if (!STATE_RULES[this.state]?.allowFlightInput) return;
+
+        e.preventDefault();
+        const wPt = this.clientToWorld(e.clientX, e.clientY);
+        this.plane.targetX = clamp(wPt.x + this.input.dragOffsetX, PLAY_MIN_X, PLAY_MAX_X);
+        this.plane.targetY = clamp(wPt.y + this.input.dragOffsetY, PLAY_MIN_Y, PLAY_MAX_Y);
+        this.input.lastMethod = 'drag';
+      });
+
+      const releaseDrag = (e) => {
+        if (e.pointerId !== this.input.dragPointerId) return;
+        this.input.dragPointerId = null;
+        this.plane.targetX = this.plane.x;
+        this.plane.targetY = this.plane.y;
+      };
+
+      canvas.addEventListener('pointerup', releaseDrag);
+      canvas.addEventListener('pointercancel', releaseDrag);
+      canvas.addEventListener('lostpointercapture', releaseDrag);
+    }
+
+    bindDpadAndKeyboard() {
+      // Yön düğmeleri
+      this.dom.dpadBtns.forEach((btn) => {
+        const dir = btn.getAttribute('data-dir');
+        if (!dir) return;
+
+        btn.addEventListener('pointerdown', (e) => {
+          if (!STATE_RULES[this.state]?.allowFlightInput) return;
+          e.preventDefault();
+          this.input.dpadPointers.set(e.pointerId, dir);
+          this.rebuildDpadSet();
+          this.input.lastMethod = 'dpad';
+          btn.classList.add('pressed');
+          try {
+            btn.setPointerCapture(e.pointerId);
+          } catch (err) {}
+        });
+
+        const releaseBtn = (e) => {
+          if (this.input.dpadPointers.has(e.pointerId)) {
+            this.input.dpadPointers.delete(e.pointerId);
+            this.rebuildDpadSet();
+          }
+          btn.classList.remove('pressed');
+        };
+
+        btn.addEventListener('pointerup', releaseBtn);
+        btn.addEventListener('pointercancel', releaseBtn);
+        btn.addEventListener('lostpointercapture', releaseBtn);
+      });
+
+      // Klavye: Oklar ve WASD
+      window.addEventListener('keydown', (e) => {
+        const keyMap = {
+          ArrowUp: 'up',
+          KeyW: 'up',
+          w: 'up',
+          W: 'up',
+          ArrowDown: 'down',
+          KeyS: 'down',
+          s: 'down',
+          S: 'down',
+          ArrowLeft: 'left',
+          KeyA: 'left',
+          a: 'left',
+          A: 'left',
+          ArrowRight: 'right',
+          KeyD: 'right',
+          d: 'right',
+          D: 'right'
+        };
+
+        if (e.key === 'Escape' || e.key === 'p' || e.key === 'P') {
+          if (this.state === 'playing' || this.state === 'tutorial') {
+            e.preventDefault();
+            this.pauseGame();
+            return;
+          }
+        }
+
+        const mapped = keyMap[e.code] || keyMap[e.key];
+        if (!mapped) return;
+
+        // Oyun aktifken ilgili tuşların sayfayı kaydırmasını önle; menüde engelleme
+        if (STATE_RULES[this.state]?.allowFlightInput) {
+          e.preventDefault();
+          this.input.keys.add(mapped);
+          this.input.lastMethod = 'keyboard';
+        }
+      });
+
+      window.addEventListener('keyup', (e) => {
+        const keyMap = {
+          ArrowUp: 'up',
+          KeyW: 'up',
+          w: 'up',
+          W: 'up',
+          ArrowDown: 'down',
+          KeyS: 'down',
+          s: 'down',
+          S: 'down',
+          ArrowLeft: 'left',
+          KeyA: 'left',
+          a: 'left',
+          A: 'left',
+          ArrowRight: 'right',
+          KeyD: 'right',
+          d: 'right',
+          D: 'right'
+        };
+        const mapped = keyMap[e.code] || keyMap[e.key];
+        if (mapped) {
+          this.input.keys.delete(mapped);
+        }
+      });
+    }
+
+    rebuildDpadSet() {
+      this.input.dpadDirs.clear();
+      for (const dir of this.input.dpadPointers.values()) {
+        this.input.dpadDirs.add(dir);
+      }
+    }
+
+    clearAllInputs() {
+      this.input.keys.clear();
+      this.input.dpadDirs.clear();
+      this.input.dpadPointers.clear();
+      this.input.padPointerId = null;
+      this.input.padLastWorld = null;
+      this.input.dragPointerId = null;
+      if (this.dom.relativeTouchPad) {
+        this.dom.relativeTouchPad.classList.remove('active-pad');
+      }
+      this.updatePadRipple(0, 0, false);
+      if (this.dom.dpadBtns) {
+        this.dom.dpadBtns.forEach((b) => b.classList.remove('pressed'));
+      }
+      this.plane.targetX = this.plane.x;
+      this.plane.targetY = this.plane.y;
+    }
+
+    // --------------------------------------------------------------------------
+    // DURUM GEÇİŞLERİ VE YENİ TUR KURULUMU
+    // --------------------------------------------------------------------------
+    setDifficulty(mode) {
+      if (!DIFFICULTY_MODES[mode]) return;
+      this.difficulty = mode;
+      this.savePreference('gokyuzu_difficulty', mode);
+      this.updateDifficultyButtons();
+    }
+
+    updateDifficultyButtons() {
+      if (!this.dom.modeRahatBtn || !this.dom.modeKesifBtn) return;
+      const isRahat = this.difficulty === 'rahat';
+      this.dom.modeRahatBtn.classList.toggle('selected', isRahat);
+      this.dom.modeRahatBtn.setAttribute('aria-checked', String(isRahat));
+      this.dom.modeKesifBtn.classList.toggle('selected', !isRahat);
+      this.dom.modeKesifBtn.setAttribute('aria-checked', String(!isRahat));
+    }
+
+    updateSoundButtons() {
+      const on = this.sound.enabled;
+      if (this.dom.hudSoundIcon) this.dom.hudSoundIcon.textContent = on ? '🔊' : '🔇';
+      if (this.dom.hudSoundLabel) this.dom.hudSoundLabel.textContent = on ? 'Ses Açık' : 'Ses Kapalı';
+      if (this.dom.menuSoundIcon) this.dom.menuSoundIcon.textContent = on ? '🔊' : '🔇';
+      if (this.dom.menuSoundLabel) this.dom.menuSoundLabel.textContent = on ? 'Ses: Açık' : 'Ses: Kapalı';
+    }
+
+    toggleFullscreen() {
+      const docEl = document.documentElement;
+      try {
+        if (!document.fullscreenElement) {
+          if (docEl.requestFullscreen) {
+            docEl.requestFullscreen().catch(() => {});
+          }
+        } else if (document.exitFullscreen) {
+          document.exitFullscreen().catch(() => {});
+        }
+      } catch (e) {
+        // Tam ekran desteği yoksa normal ekran kullanımını sürdür
+      }
+    }
+
+    resetWorldEntities(customSeed) {
+      this.clearAllInputs();
+      this.simTime = 0;
+      this.accumulator = 0;
+      this.flags = 0;
+      this.score = 0;
+      this.lives = INITIAL_LIVES;
+      this.sceneIndex = 0;
+      this.transitionTimer = 0;
+      this.countdownTimer = 0;
+      this.winGlideTimer = 0;
+      this.pendingConfirmAction = null;
+      this.toastTimer = 0;
+      if (this.dom.toastBanner) this.dom.toastBanner.classList.add('hidden');
+
+      if (typeof customSeed === 'number') {
+        this.seed = customSeed >>> 0;
+      } else {
+        this.seed = (this.seed + 104729) >>> 0;
+      }
+      this.rng = createPRNG(this.seed);
+
+      this.plane.x = PLANE_START_X;
+      this.plane.y = PLANE_START_Y;
+      this.plane.targetX = PLANE_START_X;
+      this.plane.targetY = PLANE_START_Y;
+      this.plane.vx = 0;
+      this.plane.vy = 0;
+      this.plane.bankAngle = 0;
+      this.plane.invulnTimer = 0;
+      this.plane.damagedByIds.clear();
+      this.plane.hitFlashTimer = 0;
+
+      this.flagItems.length = 0;
+      this.obstacles.length = 0;
+      this.particles.length = 0;
+      this.floatingTexts.length = 0;
+      this.confetti.length = 0;
+
+      this.spawner.nextSpawnX = 940;
+      this.spawner.lastExitY = PLANE_START_Y;
+      this.spawner.lastFlagY = PLANE_START_Y;
+      this.spawner.segmentCount = 0;
+      this.spawner.lastTemplateId = '';
+
+      this.hudCache.flags = -1;
+      this.hudCache.score = -1;
+      this.hudCache.lives = -1;
+      this.hudCache.sceneIndex = -1;
+    }
+
+    startTutorial() {
+      this.resetWorldEntities(19231029);
+      this.state = 'tutorial';
+      this.tutorial.step = 1;
+      this.tutorial.ring = { x: 640, y: 270, r: 58, progress: 0 };
+      this.tutorial.flagSpawned = false;
+      this.tutorial.obstacleSpawned = false;
+      this.updateTutorialUi();
+      this.syncUiForState();
+      this.updateHudDom();
+    }
+
+    startNewGame(customSeed) {
+      this.resetWorldEntities(customSeed);
+      this.state = 'playing';
+      // Başlangıç parkurunu hazırla
+      this.ensureSegmentsAhead();
+      this.syncUiForState();
+      this.updateHudDom();
+      this.showToast('Rotanı seç, güvenle uç, bayrakları topla!', 2.2);
+    }
+
+    goToMenu() {
+      this.clearAllInputs();
+      this.sound.stopAll();
+      this.toastTimer = 0;
+      if (this.dom.toastBanner) {
+        this.dom.toastBanner.classList.add('hidden');
+      }
+      this.state = 'menu';
+      this.syncUiForState();
+    }
+
+    pauseGame() {
+      if (this.state !== 'playing' && this.state !== 'tutorial' && this.state !== 'resumeCountdown') {
+        return;
+      }
+      this.previousActiveState = this.state === 'tutorial' ? 'tutorial' : 'playing';
+      this.clearAllInputs();
+      this.state = 'paused';
+      this.pendingConfirmAction = null;
+      if (this.dom.pauseConfirmBox) this.dom.pauseConfirmBox.classList.add('hidden');
+      if (this.dom.pauseMainButtons) this.dom.pauseMainButtons.classList.remove('hidden');
+      if (this.dom.pauseStatusText) {
+        this.dom.pauseStatusText.textContent = `Bayrak: ${this.flags}/${TARGET_FLAGS} • Puan: ${this.score} • ${this.lives} can`;
+      }
+      this.syncUiForState();
+    }
+
+    askPauseConfirm(action, message) {
+      this.pendingConfirmAction = action;
+      if (this.dom.confirmMsg) this.dom.confirmMsg.textContent = message;
+      if (this.dom.pauseMainButtons) this.dom.pauseMainButtons.classList.add('hidden');
+      if (this.dom.pauseConfirmBox) this.dom.pauseConfirmBox.classList.remove('hidden');
+    }
+
+    startResumeCountdown() {
+      if (this.state !== 'paused') return;
+      this.clearAllInputs();
+      this.state = 'resumeCountdown';
+      this.countdownTimer = RESUME_COUNTDOWN_DURATION;
+      if (this.dom.countdownNumber) {
+        this.dom.countdownNumber.textContent = '3';
+      }
+      this.syncUiForState();
+    }
+
+    triggerSceneTransition(newSceneIdx) {
+      this.sceneIndex = newSceneIdx;
+      this.state = 'levelTransition';
+      this.transitionTimer = TRANSITION_DURATION;
+      const sc = SCENES[newSceneIdx] || SCENES[0];
+      if (this.dom.transitionTitle) this.dom.transitionTitle.textContent = sc.name;
+      if (this.dom.transitionDesc) this.dom.transitionDesc.textContent = sc.desc;
+      this.sound.playTransition();
+      this.updateHudDom();
+      this.syncUiForState();
+    }
+
+    triggerWin() {
+      this.flags = TARGET_FLAGS;
+      this.score = TARGET_FLAGS * POINTS_PER_FLAG; // 150 puan
+      this.state = 'won';
+      this.winGlideTimer = 0;
+      this.clearAllInputs();
+      // Aktif engel simülasyonunu durdur ve temizle
+      this.obstacles.length = 0;
+      this.flagItems.length = 0;
+      this.spawnWinConfetti();
+      this.sound.playWin();
+
+      if (this.dom.winFlagsVal) this.dom.winFlagsVal.textContent = `${this.flags} / ${TARGET_FLAGS}`;
+      if (this.dom.winScoreVal) this.dom.winScoreVal.textContent = `${this.score}`;
+      if (this.dom.winLivesVal) this.dom.winLivesVal.textContent = `${this.lives} Can`;
+
+      this.updateHudDom();
+      this.syncUiForState();
+    }
+
+    triggerLost() {
+      this.lives = 0;
+      this.state = 'lost';
+      this.clearAllInputs();
+      if (this.dom.lostFlagsVal) this.dom.lostFlagsVal.textContent = `${this.flags} / ${TARGET_FLAGS}`;
+      if (this.dom.lostScoreVal) this.dom.lostScoreVal.textContent = `${this.score}`;
+      this.updateHudDom();
+      this.syncUiForState();
+    }
+
+    syncUiForState() {
+      const rules = STATE_RULES[this.state] || STATE_RULES.menu;
+      if (this.dom.hudBar) this.dom.hudBar.classList.toggle('hidden', !rules.showHud);
+      if (this.dom.controlDock) this.dom.controlDock.classList.toggle('hidden', !rules.showDock);
+      if (this.dom.menuScreen) this.dom.menuScreen.classList.toggle('hidden', this.state !== 'menu');
+      if (this.dom.tutorialPanel) this.dom.tutorialPanel.classList.toggle('hidden', this.state !== 'tutorial');
+      if (this.dom.pauseScreen) this.dom.pauseScreen.classList.toggle('hidden', this.state !== 'paused');
+      if (this.dom.transitionOverlay) {
+        this.dom.transitionOverlay.classList.toggle('hidden', this.state !== 'levelTransition');
+      }
+      if (this.dom.countdownOverlay) {
+        this.dom.countdownOverlay.classList.toggle('hidden', this.state !== 'resumeCountdown');
+      }
+      if (this.dom.winScreen) this.dom.winScreen.classList.toggle('hidden', this.state !== 'won');
+      if (this.dom.lostScreen) this.dom.lostScreen.classList.toggle('hidden', this.state !== 'lost');
+    }
+
+    updateHudDom() {
+      if (this.hudCache.flags !== this.flags) {
+        this.hudCache.flags = this.flags;
+        if (this.dom.hudFlagText) {
+          this.dom.hudFlagText.textContent = `Bayrak ${this.flags}/${TARGET_FLAGS}`;
+        }
+      }
+      if (this.hudCache.score !== this.score) {
+        this.hudCache.score = this.score;
+        if (this.dom.hudScoreText) {
+          this.dom.hudScoreText.textContent = `Puan ${this.score}`;
+        }
+      }
+      if (this.hudCache.lives !== this.lives) {
+        this.hudCache.lives = this.lives;
+        if (this.dom.hudHearts) {
+          const fullHearts = '❤️'.repeat(Math.max(0, this.lives));
+          const emptyHearts = '🤍'.repeat(Math.max(0, INITIAL_LIVES - this.lives));
+          this.dom.hudHearts.textContent = fullHearts + emptyHearts;
+        }
+        if (this.dom.hudLivesText) {
+          this.dom.hudLivesText.textContent = `${this.lives} can`;
+        }
+      }
+      const sceneKey = this.state === 'tutorial' ? -2 : this.sceneIndex;
+      if (this.hudCache.sceneIndex !== sceneKey) {
+        this.hudCache.sceneIndex = sceneKey;
+        if (this.dom.hudSceneBadge) {
+          if (this.state === 'tutorial') {
+            this.dom.hudSceneBadge.textContent = 'Eğitim Uçuşu';
+          } else {
+            const sc = SCENES[this.sceneIndex] || SCENES[0];
+            this.dom.hudSceneBadge.textContent = sc.name;
+          }
+        }
+      }
+    }
+
+    showToast(text, duration = 1.6) {
+      if (!this.dom.toastBanner) return;
+      this.dom.toastBanner.textContent = text;
+      this.dom.toastBanner.classList.remove('hidden');
+      this.toastTimer = duration;
+    }
+
+    // --------------------------------------------------------------------------
+    // ETKİLEŞİMLİ EĞİTİM UÇUŞU (3 ADIM)
+    // --------------------------------------------------------------------------
+    updateTutorialUi() {
+      if (!this.dom.tutorialStepBadge || !this.dom.tutorialInstruction) return;
+      if (this.tutorial.step === 1) {
+        this.dom.tutorialStepBadge.textContent = 'Alıştırma 1/3';
+        this.dom.tutorialInstruction.textContent = 'Uçağı yukarıdaki parlak hedef halkaya götür.';
+        this.dom.tutorialReadyBtn.classList.add('hidden');
+      } else if (this.tutorial.step === 2) {
+        this.dom.tutorialStepBadge.textContent = 'Alıştırma 2/3';
+        this.dom.tutorialInstruction.textContent = 'Harika! Şimdi Türk bayrağı simgesini topla.';
+        this.dom.tutorialReadyBtn.classList.add('hidden');
+      } else if (this.tutorial.step === 3) {
+        this.dom.tutorialStepBadge.textContent = 'Alıştırma 3/3';
+        this.dom.tutorialInstruction.textContent =
+          'Koyu rüzgâr bulutundan uzak dur ve altındaki geniş güvenli geçitten uç!';
+        this.dom.tutorialReadyBtn.classList.add('hidden');
+      } else {
+        this.dom.tutorialStepBadge.textContent = 'Tamamlandı!';
+        this.dom.tutorialInstruction.textContent =
+          'Tebrikler! Kontrolleri öğrendin. Bayram uçuşuna hazırsın!';
+        this.dom.tutorialReadyBtn.classList.remove('hidden');
+      }
+    }
+
+    stepTutorial(dt) {
+      if (this.tutorial.step === 1) {
+        const ring = this.tutorial.ring;
+        const dist = Math.hypot(this.plane.x - ring.x, this.plane.y - ring.y);
+        if (dist <= ring.r + 38) {
+          this.sound.playCollect();
+          this.spawnCollectBurst(ring.x, ring.y);
+          this.tutorial.step = 2;
+          this.tutorial.flagSpawned = true;
+          this.flagItems.push({
+            id: this.nextEntityId++,
+            x: 1180,
+            y: 430,
+            r: 34,
+            collected: false,
+            waveOffset: 0
+          });
+          this.updateTutorialUi();
+        }
+      } else if (this.tutorial.step === 2) {
+        for (let i = this.flagItems.length - 1; i >= 0; i--) {
+          const fl = this.flagItems[i];
+          fl.x -= 155 * dt;
+          fl.waveOffset += dt * 4;
+          if (this.checkPlaneFlagOverlap(fl)) {
+            fl.collected = true;
+            this.flagItems.splice(i, 1);
+            this.sound.playCollect();
+            this.spawnCollectBurst(fl.x, fl.y);
+            this.addFloatingText(fl.x, fl.y - 24, 'Harika!', '#ffd166');
+            this.tutorial.step = 3;
+            this.tutorial.obstacleSpawned = true;
+            this.tutorial.safeGateX = 1280;
+            this.obstacles.push({
+              id: this.nextEntityId++,
+              type: 'windCloud',
+              x: 1280,
+              y: 250,
+              baseY: 250,
+              rX: 66,
+              rY: 44,
+              bobAmp: 0,
+              bobPhase: 0
+            });
+            this.updateTutorialUi();
+            break;
+          } else if (fl.x < -80) {
+            // Kaçırılırsa yeniden gelsin
+            fl.x = 1200;
+            fl.y = clamp(this.plane.y, 240, 580);
+          }
+        }
+      } else if (this.tutorial.step === 3) {
+        this.tutorial.safeGateX -= 170 * dt;
+        for (let i = this.obstacles.length - 1; i >= 0; i--) {
+          const ob = this.obstacles[i];
+          ob.x -= 170 * dt;
+          if (this.checkPlaneObstacleOverlap(ob)) {
+            // Alıştırmada can kaybı yok, nazik uyarı
+            this.showToast('Koyu rüzgâr bulutuna değdin! Altındaki yeşil geçitten uç.', 1.5);
+            ob.x = 1260;
+            this.tutorial.safeGateX = 1260;
+          } else if (ob.x < this.plane.x - 130) {
+            this.obstacles.splice(i, 1);
+            this.sound.playTransition();
+            this.tutorial.step = 4;
+            this.updateTutorialUi();
+          }
+        }
+      }
+    }
+
+    // --------------------------------------------------------------------------
+    // ADİL PARKUR ÜRETİMİ VE DOĞRULAMA
+    // --------------------------------------------------------------------------
+    ensureSegmentsAhead() {
+      if (this.state !== 'playing') return;
+      if (this.flags >= TARGET_FLAGS) return;
+
+      const modeCfg = DIFFICULTY_MODES[this.difficulty] || DIFFICULTY_MODES.rahat;
+      const horizonX = WORLD_W + 680;
+
+      while (this.spawner.nextSpawnX < horizonX) {
+        this.spawnNextSegment(modeCfg);
+      }
+    }
+
+    spawnNextSegment(modeCfg) {
+      let chosen = null;
+
+      if (this.spawner.segmentCount === 0) {
+        chosen = OPENING_TEMPLATE;
+      } else {
+        // Mevcut sahneye uygun ve geçiş kuralını sağlayan şablonları filtrele
+        const candidates = TRACK_TEMPLATES.filter((tpl) => {
+          if (!tpl.stages.includes(this.sceneIndex)) return false;
+          if (tpl.id === this.spawner.lastTemplateId) return false;
+          const check = validateSegmentTransition(
+            this.spawner.lastExitY,
+            tpl,
+            modeCfg,
+            this.sceneIndex,
+            this.spawner.lastFlagY
+          );
+          return check.valid;
+        });
+
+        if (candidates.length > 0) {
+          const pickIdx = this.rng.int(0, candidates.length - 1);
+          chosen = candidates[pickIdx];
+        } else {
+          // Geçerli şablon bulunamazsa güvenli seyrek parçaya dön (farklı bayrak yüksekliğiyle)
+          const altY = this.spawner.lastFlagY > 416 ? 300 : 530;
+          chosen = {
+            ...SAFE_FALLBACK_TEMPLATE,
+            entryY: altY,
+            exitY: altY,
+            flag: { x: 260, y: altY },
+            obstacles: [
+              {
+                type: 'buoy',
+                x: 360,
+                y: altY > 416 ? 240 : 600,
+                rX: 38,
+                rY: 38
+              }
+            ]
+          };
+        }
+      }
+
+      const startX = Math.max(this.spawner.nextSpawnX, WORLD_W + 80);
+
+      // Bayrak simgesi ekle
+      const flagX = startX + chosen.flag.x;
+      const flagY = clamp(chosen.flag.y, PLAY_MIN_Y + 24, PLAY_MAX_Y - 24);
+      this.flagItems.push({
+        id: this.nextEntityId++,
+        x: flagX,
+        y: flagY,
+        r: 34,
+        collected: false,
+        waveOffset: this.rng.range(0, Math.PI * 2)
+      });
+
+      // Engelleri ekle (Rahat modda koridor genişliğine göre engelleri merkezden biraz daha uzaklaştır)
+      const bonusShift = modeCfg.corridorBonus;
+      chosen.obstacles.forEach((obDef) => {
+        const obX = startX + obDef.x;
+        let obY = obDef.y;
+        if (bonusShift > 0) {
+          obY += obY < chosen.entryY ? -bonusShift * 0.5 : bonusShift * 0.5;
+        }
+        obY = clamp(obY, PLAY_MIN_Y + obDef.rY, PLAY_MAX_Y - obDef.rY);
+
+        // Bayrakla engel aynı noktada doğmasın (ek güvenlik doğrulaması)
+        if (
+          Math.abs(obX - flagX) < obDef.rX + 56 &&
+          Math.abs(obY - flagY) < obDef.rY + 56
+        ) {
+          return;
+        }
+
+        this.obstacles.push({
+          id: this.nextEntityId++,
+          type: obDef.type,
+          x: obX,
+          y: obY,
+          baseY: obY,
+          rX: obDef.rX,
+          rY: obDef.rY,
+          bobAmp: obDef.bobAmp || 0,
+          bobPhase: this.rng.range(0, Math.PI * 2)
+        });
+      });
+
+      this.spawner.nextSpawnX = startX + chosen.length + modeCfg.segmentGap;
+      this.spawner.lastExitY = chosen.exitY;
+      this.spawner.lastFlagY = flagY;
+      this.spawner.segmentCount += 1;
+      this.spawner.lastTemplateId = chosen.id;
+    }
+
+    // --------------------------------------------------------------------------
+    // FİZİK, HAREKET VE ÇARPIŞMA GÜNCELLEMESİ (Sabit Alt Adım)
+    // --------------------------------------------------------------------------
+    updatePhysicsStep(dt) {
+      this.simTime += dt;
+      this.plane.propAngle = (this.plane.propAngle + dt * 38) % (Math.PI * 2);
+
+      if (this.toastTimer > 0) {
+        this.toastTimer -= dt;
+        if (this.toastTimer <= 0 && this.dom.toastBanner) {
+          this.dom.toastBanner.classList.add('hidden');
+        }
+      }
+
+      if (this.plane.invulnTimer > 0) {
+        this.plane.invulnTimer = Math.max(0, this.plane.invulnTimer - dt);
+      }
+      if (this.plane.hitFlashTimer > 0) {
+        this.plane.hitFlashTimer = Math.max(0, this.plane.hitFlashTimer - dt);
+      }
+
+      // 1. Uçak Hareketi
+      this.updatePlaneMovement(dt);
+
+      // 2. Arka Plan Parallax Akışı (Ana nesnelerden yavaş, göz yormaz)
+      const modeCfg = DIFFICULTY_MODES[this.difficulty] || DIFFICULTY_MODES.rahat;
+      const scrollSpeed = modeCfg.speeds[this.sceneIndex] || modeCfg.speeds[0];
+      const bgMotionScale = this.reducedMotion ? 0.25 : 1.0;
+
+      this.bgLayers.farScroll = (this.bgLayers.farScroll + scrollSpeed * 0.14 * bgMotionScale * dt) % WORLD_W;
+      this.bgLayers.midScroll = (this.bgLayers.midScroll + scrollSpeed * 0.28 * bgMotionScale * dt) % WORLD_W;
+      this.bgLayers.cityScroll = (this.bgLayers.cityScroll + scrollSpeed * 0.42 * bgMotionScale * dt) % WORLD_W;
+
+      this.bgLayers.decoClouds.forEach((dc) => {
+        dc.x -= scrollSpeed * dc.speedMul * bgMotionScale * dt;
+        if (dc.x < -180) dc.x = WORLD_W + 160;
+      });
+
+      // Eğitim modundaysa eğitim adımlarını çalıştır
+      if (this.state === 'tutorial') {
+        this.stepTutorial(dt);
+        this.updateEffects(dt);
+        return;
+      }
+
+      if (this.state !== 'playing') return;
+
+      // 3. Parkur Parçalarını İlerlet
+      this.spawner.nextSpawnX -= scrollSpeed * dt;
+      this.ensureSegmentsAhead();
+
+      // Engelleri ilerlet
+      for (let i = this.obstacles.length - 1; i >= 0; i--) {
+        const ob = this.obstacles[i];
+        ob.x -= scrollSpeed * dt;
+        if (ob.bobAmp > 0 && !this.reducedMotion) {
+          ob.bobPhase += dt * 2.1;
+          ob.y = clamp(
+            ob.baseY + Math.sin(ob.bobPhase) * ob.bobAmp,
+            PLAY_MIN_Y + ob.rY,
+            PLAY_MAX_Y - ob.rY
+          );
+        }
+        if (ob.x < -160) {
+          this.obstacles.splice(i, 1);
+        }
+      }
+
+      // Bayrak simgelerini ilerlet
+      for (let i = this.flagItems.length - 1; i >= 0; i--) {
+        const fl = this.flagItems[i];
+        fl.x -= scrollSpeed * dt;
+        fl.waveOffset += dt * 4.5;
+        // Kaçırılan bayrak ekran dışına sessizce çıkar (yanma/parçalanma yok, can azaltmaz)
+        if (fl.x < -100) {
+          this.flagItems.splice(i, 1);
+        }
+      }
+
+      // 4. DETERMİNİSTİK ÇARPIŞMA VE TOPLAMA KURALI (Bölüm 12 & Test 7):
+      // Önce engel hasarını işle. Can 0 olursa uçuş biter ve o adımda bayrak puanı eklenmez!
+      for (let i = 0; i < this.obstacles.length; i++) {
+        const ob = this.obstacles[i];
+        if (this.plane.damagedByIds.has(ob.id)) continue;
+
+        if (this.checkPlaneObstacleOverlap(ob)) {
+          // Aynı engel örneği bir turda en fazla bir kez hasar verebilir
+          this.plane.damagedByIds.add(ob.id);
+
+          if (this.plane.invulnTimer <= 0) {
+            this.applyObstacleDamage(ob);
+            if (this.lives <= 0) {
+              // Can sıfırlandı: hemen uçuş molasına geç, bayrak toplamayı işleme!
+              this.triggerLost();
+              return;
+            }
+          }
+        }
+      }
+
+      // 5. Can hala > 0 ise Bayrak Toplamayı İşle
+      for (let i = this.flagItems.length - 1; i >= 0; i--) {
+        const fl = this.flagItems[i];
+        if (fl.collected) continue;
+
+        if (this.checkPlaneFlagOverlap(fl)) {
+          fl.collected = true;
+          this.flagItems.splice(i, 1);
+          this.collectFlag(fl);
+          // 15. bayrakta veya sahne geçişinde durum değiştiyse döngüden çık
+          if (this.state !== 'playing') {
+            return;
+          }
+        }
+      }
+
+      this.updateEffects(dt);
+    }
+
+    updatePlaneMovement(dt) {
+      const modeCfg = DIFFICULTY_MODES[this.difficulty] || DIFFICULTY_MODES.rahat;
+      const maxSpeed = modeCfg.planeSpeed;
+
+      // Klavye veya Yön düğmeleri aktif mi?
+      const activeDirs =
+        this.input.lastMethod === 'dpad' && this.input.dpadDirs.size > 0
+          ? this.input.dpadDirs
+          : this.input.keys.size > 0
+          ? this.input.keys
+          : this.input.dpadDirs;
+
+      if (
+        (this.input.lastMethod === 'keyboard' || this.input.lastMethod === 'dpad') &&
+        activeDirs.size > 0
+      ) {
+        let dirX = (activeDirs.has('right') ? 1 : 0) - (activeDirs.has('left') ? 1 : 0);
+        let dirY = (activeDirs.has('down') ? 1 : 0) - (activeDirs.has('up') ? 1 : 0);
+
+        // Çapraz harekette hızı normalize et
+        if (dirX !== 0 && dirY !== 0) {
+          const inv = 1 / Math.SQRT2;
+          dirX *= inv;
+          dirY *= inv;
+        }
+
+        this.plane.vx = dirX * maxSpeed;
+        this.plane.vy = dirY * maxSpeed;
+        this.plane.x = clamp(this.plane.x + this.plane.vx * dt, PLAY_MIN_X, PLAY_MAX_X);
+        this.plane.y = clamp(this.plane.y + this.plane.vy * dt, PLAY_MIN_Y, PLAY_MAX_Y);
+        this.plane.targetX = this.plane.x;
+        this.plane.targetY = this.plane.y;
+      } else {
+        // Göreli panel veya doğrudan sürükleme hedefini hız sınırıyla takip et
+        const dx = this.plane.targetX - this.plane.x;
+        const dy = this.plane.targetY - this.plane.y;
+        const dist = Math.hypot(dx, dy);
+        const maxStep = maxSpeed * 1.35 * dt;
+
+        if (dist <= 0.5) {
+          this.plane.x = this.plane.targetX;
+          this.plane.y = this.plane.targetY;
+          this.plane.vx = 0;
+          this.plane.vy = 0;
+        } else if (dist <= maxStep) {
+          this.plane.vx = dx / dt;
+          this.plane.vy = dy / dt;
+          this.plane.x = this.plane.targetX;
+          this.plane.y = this.plane.targetY;
+        } else {
+          const ux = dx / dist;
+          const uy = dy / dist;
+          this.plane.vx = ux * maxSpeed * 1.35;
+          this.plane.vy = uy * maxSpeed * 1.35;
+          this.plane.x = clamp(this.plane.x + ux * maxStep, PLAY_MIN_X, PLAY_MAX_X);
+          this.plane.y = clamp(this.plane.y + uy * maxStep, PLAY_MIN_Y, PLAY_MAX_Y);
+        }
+      }
+
+      // Görsel kanat eğimi (Hitbox'ı değiştirmez)
+      const targetBank = clamp((this.plane.vy / maxSpeed) * 0.24, -0.26, 0.26);
+      this.plane.bankAngle += (targetBank - this.plane.bankAngle) * Math.min(1, dt * 14);
+    }
+
+    checkPlaneObstacleOverlap(ob) {
+      const halfW = PLANE_HITBOX_W * 0.5;
+      const halfH = PLANE_HITBOX_H * 0.5;
+      const dx = Math.abs(this.plane.x - ob.x);
+      const dy = Math.abs(this.plane.y - ob.y);
+      return dx < halfW + ob.rX * 0.86 && dy < halfH + ob.rY * 0.86;
+    }
+
+    checkPlaneFlagOverlap(fl) {
+      const halfW = PLANE_COLLECT_W * 0.5;
+      const halfH = PLANE_COLLECT_H * 0.5;
+      const dx = Math.abs(this.plane.x - fl.x);
+      const dy = Math.abs(this.plane.y - fl.y);
+      return dx < halfW + fl.r && dy < halfH + fl.r;
+    }
+
+    applyObstacleDamage(hitObstacle) {
+      this.lives = Math.max(0, this.lives - 1);
+      this.plane.invulnTimer = INVULN_DURATION;
+      this.plane.hitFlashTimer = 0.45;
+      this.sound.playHit();
+      this.updateHudDom();
+
+      // Can kaybından sonra yeni engelle hemen çarpışmayı önlemek için yakın tehlikeleri etkisizleştir
+      this.obstacles.forEach((other) => {
+        if (
+          other.x > this.plane.x - 100 &&
+          other.x < this.plane.x + 310 &&
+          Math.abs(other.y - this.plane.y) < 170
+        ) {
+          this.plane.damagedByIds.add(other.id);
+        }
+      });
+
+      if (this.lives > 0) {
+        this.addFloatingText(this.plane.x, this.plane.y - 44, 'Dikkat! Kalkan Aktif', '#ffb703');
+        this.showToast('Rüzgâr engeline değdin! Güvenli koridoru takip et.', 1.5);
+      }
+    }
+
+    collectFlag(fl) {
+      if (this.flags >= TARGET_FLAGS) return;
+      this.flags = Math.min(TARGET_FLAGS, this.flags + 1);
+      this.score = this.flags * POINTS_PER_FLAG; // Her zaman bayrak * 10
+
+      this.sound.playCollect();
+      this.spawnCollectBurst(fl.x, fl.y);
+      this.addFloatingText(fl.x, fl.y - 26, '+10', '#ffd166');
+
+      const praises = ['Güzel rota!', 'Bir bayrak daha!', 'Harika uçuş!', 'Cumhuriyet için uç!'];
+      if (this.flags % 3 === 0 && this.flags < TARGET_FLAGS) {
+        const msg = praises[(this.flags / 3 - 1) % praises.length];
+        this.showToast(msg, 1.3);
+      }
+
+      this.updateHudDom();
+
+      // 15. bayrakta hemen kazanma durumuna geç
+      if (this.flags >= TARGET_FLAGS) {
+        this.triggerWin();
+        return;
+      }
+
+      // 5. ve 10. bayrakta sahne geçişi
+      if (this.flags === 5 && this.sceneIndex === 0) {
+        this.triggerSceneTransition(1);
+      } else if (this.flags === 10 && this.sceneIndex === 1) {
+        this.triggerSceneTransition(2);
+      }
+    }
+
+    // --------------------------------------------------------------------------
+    // PARÇACIK HAVUZU VE BİLDİRİM METİNLERİ (Sınırlı Boyut)
+    // --------------------------------------------------------------------------
+    spawnCollectBurst(x, y) {
+      const count = this.reducedMotion ? 4 : 10;
+      for (let i = 0; i < count; i++) {
+        if (this.particles.length >= 60) {
+          this.particles.shift();
+        }
+        const angle = (Math.PI * 2 * i) / count;
+        const speed = 90 + (i % 3) * 45;
+        this.particles.push({
+          x,
+          y,
+          vx: Math.cos(angle) * speed,
+          vy: Math.sin(angle) * speed,
+          life: 0.48,
+          maxLife: 0.48,
+          color: i % 2 === 0 ? '#ffd166' : '#ffffff',
+          r: 5
+        });
+      }
+      // Toplama halkası
+      this.particles.push({
+        x,
+        y,
+        vx: 0,
+        vy: 0,
+        life: 0.42,
+        maxLife: 0.42,
+        isRing: true,
+        color: '#ffd166',
+        r: 28
+      });
+    }
+
+    addFloatingText(x, y, text, color) {
+      // Metinler birikmesin; aynı anda en fazla 4 bildirim
+      if (this.floatingTexts.length >= 4) {
+        this.floatingTexts.shift();
+      }
+      this.floatingTexts.push({
+        x,
+        y,
+        text,
+        color: color || '#ffd166',
+        life: 0.75,
+        maxLife: 0.75
+      });
+    }
+
+    spawnWinConfetti() {
+      this.confetti.length = 0;
+      const count = this.reducedMotion ? 16 : 60;
+      const colors = ['#e30a17', '#ffffff', '#ffd166', '#4ea8de'];
+      for (let i = 0; i < count; i++) {
+        this.confetti.push({
+          x: 220 + ((i * 23) % 1160),
+          y: 60 + ((i * 37) % 240),
+          vx: ((i % 7) - 3) * 28,
+          vy: 75 + (i % 5) * 25,
+          rot: (i * 0.7) % (Math.PI * 2),
+          vRot: ((i % 2 === 0 ? 1 : -1) * 2.5),
+          color: colors[i % colors.length],
+          life: 2.6
+        });
+      }
+    }
+
+    updateEffects(dt) {
+      for (let i = this.particles.length - 1; i >= 0; i--) {
+        const p = this.particles[i];
+        p.life -= dt;
+        if (p.life <= 0) {
+          this.particles.splice(i, 1);
+          continue;
+        }
+        if (p.isRing) {
+          p.r += 110 * dt;
+        } else {
+          p.x += p.vx * dt;
+          p.y += p.vy * dt;
+        }
+      }
+
+      for (let i = this.floatingTexts.length - 1; i >= 0; i--) {
+        const ft = this.floatingTexts[i];
+        ft.life -= dt;
+        ft.y -= 42 * dt;
+        if (ft.life <= 0) {
+          this.floatingTexts.splice(i, 1);
+        }
+      }
+    }
+
+    // --------------------------------------------------------------------------
+    // ANA OYUN DÖNGÜSÜ (Tek requestAnimationFrame Zinciri)
+    // --------------------------------------------------------------------------
+    startLoop() {
+      if (this.rafId !== null) return; // İkinci döngü asla açılmaz
+      this.loopStartCount += 1;
+      this.lastFrameTime = performance.now();
+
+      const tick = (now) => {
+        const rawDt = Math.max(0, (now - this.lastFrameTime) / 1000);
+        this.lastFrameTime = now;
+        const dt = Math.min(rawDt, MAX_FRAME_DT);
+
+        this.stepFrame(dt);
+        this.render();
+
+        this.rafId = requestAnimationFrame(tick);
+      };
+
+      this.rafId = requestAnimationFrame(tick);
+    }
+
+    /**
+     * Hem gerçek zamanlı RAF döngüsü hem de deterministik testler tarafından
+     * çağrılabilen çerçeve ilerletme metodu.
+     */
+    stepFrame(dt) {
+      const clampedDt = clamp(dt, 0, MAX_FRAME_DT);
+
+      if (this.state === 'menu') {
+        this.menuAnimTime += clampedDt;
+        return;
+      }
+
+      if (this.state === 'levelTransition') {
+        this.transitionTimer -= clampedDt;
+        if (this.transitionTimer <= 0) {
+          // Geçişten sonra uçağın önünde en az 2 saniyelik güvenli koridor sağla
+          const modeCfg = DIFFICULTY_MODES[this.difficulty] || DIFFICULTY_MODES.rahat;
+          const speed = modeCfg.speeds[this.sceneIndex] || 200;
+          const safeClearDist = speed * POST_TRANSITION_SAFE_SECONDS;
+
+          for (let i = this.obstacles.length - 1; i >= 0; i--) {
+            if (this.obstacles[i].x < this.plane.x + safeClearDist) {
+              this.obstacles.splice(i, 1);
+            }
+          }
+          this.spawner.nextSpawnX = Math.max(
+            this.spawner.nextSpawnX,
+            this.plane.x + safeClearDist + 120
+          );
+
+          this.state = 'playing';
+          this.syncUiForState();
+        }
+        return;
+      }
+
+      if (this.state === 'resumeCountdown') {
+        this.countdownTimer -= clampedDt;
+        const ceilSec = Math.max(1, Math.ceil(this.countdownTimer));
+        if (this.dom.countdownNumber && this.dom.countdownNumber.textContent !== String(ceilSec)) {
+          this.dom.countdownNumber.textContent = String(ceilSec);
+        }
+        if (this.countdownTimer <= 0) {
+          this.state = this.previousActiveState || 'playing';
+          this.syncUiForState();
+        }
+        return;
+      }
+
+      if (this.state === 'won') {
+        this.winGlideTimer += clampedDt;
+        // Uçak kutlama meydanına hasarsız süzülür
+        this.plane.x += (480 - this.plane.x) * Math.min(1, clampedDt * 2.5);
+        this.plane.y += (320 - this.plane.y) * Math.min(1, clampedDt * 2.5);
+        this.plane.bankAngle *= 0.9;
+        this.plane.propAngle = (this.plane.propAngle + clampedDt * 32) % (Math.PI * 2);
+
+        for (let i = this.confetti.length - 1; i >= 0; i--) {
+          const c = this.confetti[i];
+          c.life -= clampedDt;
+          if (c.life <= 0) {
+            this.confetti.splice(i, 1);
+            continue;
+          }
+          c.x += c.vx * clampedDt;
+          c.y += c.vy * clampedDt;
+          c.rot += c.vRot * clampedDt;
+        }
+        return;
+      }
+
+      if (this.state === 'paused' || this.state === 'lost') {
+        // Duraklatmada ve uçuş molasında tüm sayaçlar ve hareket durur
+        return;
+      }
+
+      // Playing veya Tutorial: Sabit alt adımlı (accumulator) fizik güncellemesi
+      this.accumulator += clampedDt;
+      let subSteps = 0;
+      while (this.accumulator >= FIXED_DT && subSteps < 12) {
+        this.updatePhysicsStep(FIXED_DT);
+        this.accumulator -= FIXED_DT;
+        subSteps += 1;
+        if (this.state !== 'playing' && this.state !== 'tutorial') {
+          this.accumulator = 0;
+          break;
+        }
+      }
+    }
+
+    // --------------------------------------------------------------------------
+    // GÖRSEL SAHNE ÇİZİMİ (2.5D Atmosfer, 29 Ekim Süslemeleri ve Uçak)
+    // --------------------------------------------------------------------------
+    render() {
+      if (!this.ctx || !this.canvas) return;
+      const ctx = this.ctx;
+      const scaleX = this.canvas.width / WORLD_W;
+      const scaleY = this.canvas.height / WORLD_H;
+
+      ctx.save();
+      ctx.scale(scaleX, scaleY);
+
+      const activeScene = SCENES[this.sceneIndex] || SCENES[0];
+      this.drawSkyAndSun(ctx, activeScene);
+      this.drawParallaxLandscape(ctx, activeScene);
+
+      if (this.state === 'menu') {
+        this.drawMenuPreviewScene(ctx);
+        ctx.restore();
+        return;
+      }
+
+      if (this.state === 'won') {
+        this.drawCelebrationPlaza(ctx);
+        this.drawShowPlane(ctx, this.plane.x, this.plane.y, this.plane.bankAngle);
+        this.drawConfetti(ctx);
+        ctx.restore();
+        return;
+      }
+
+      // Eğitim moduna özel görsel yardımcılar
+      if (this.state === 'tutorial') {
+        this.drawTutorialGuides(ctx);
+      }
+
+      // Toplanabilir Bayrak Simgeleri
+      for (let i = 0; i < this.flagItems.length; i++) {
+        this.drawFlagBadge(ctx, this.flagItems[i]);
+      }
+
+      // Engeller
+      for (let i = 0; i < this.obstacles.length; i++) {
+        this.drawObstacle(ctx, this.obstacles[i]);
+      }
+
+      // Gösteri Uçağı
+      this.drawShowPlane(ctx, this.plane.x, this.plane.y, this.plane.bankAngle);
+
+      // Efektler ve +10 bildirimleri
+      this.drawParticlesAndTexts(ctx);
+
+      ctx.restore();
+    }
+
+    drawSkyAndSun(ctx, scene) {
+      const grad = ctx.createLinearGradient(0, 0, 0, WORLD_H);
+      grad.addColorStop(0, scene.skyTop);
+      grad.addColorStop(0.55, scene.skyMid);
+      grad.addColorStop(1, scene.skyBot);
+      ctx.fillStyle = grad;
+      ctx.fillRect(0, 0, WORLD_W, WORLD_H);
+
+      // Sıcak güneş ve yumuşak halesi
+      const sunGlow = ctx.createRadialGradient(
+        scene.sunX,
+        scene.sunY,
+        24,
+        scene.sunX,
+        scene.sunY,
+        210
+      );
+      sunGlow.addColorStop(0, 'rgba(255, 243, 176, 0.95)');
+      sunGlow.addColorStop(0.35, 'rgba(255, 183, 3, 0.38)');
+      sunGlow.addColorStop(1, 'rgba(255, 183, 3, 0)');
+      ctx.fillStyle = sunGlow;
+      ctx.beginPath();
+      ctx.arc(scene.sunX, scene.sunY, 210, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.fillStyle = scene.sunColor;
+      ctx.beginPath();
+      ctx.arc(scene.sunX, scene.sunY, 54, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    drawParallaxLandscape(ctx, scene) {
+      // 1. Dekoratif Beyaz Bulutlar (Yumuşak, yarı saydam, zararsız)
+      this.bgLayers.decoClouds.forEach((dc) => {
+        this.drawDecorativeCloud(ctx, dc.x, dc.y, dc.scale);
+      });
+
+      // 2. Uzak Tepeler
+      ctx.fillStyle = scene.hillFar;
+      for (let copy = -1; copy <= 1; copy++) {
+        const baseX = copy * WORLD_W - this.bgLayers.farScroll;
+        ctx.beginPath();
+        ctx.moveTo(baseX, WORLD_H);
+        ctx.lineTo(baseX, 650);
+        ctx.quadraticCurveTo(baseX + 260, 545, baseX + 540, 640);
+        ctx.quadraticCurveTo(baseX + 860, 520, baseX + 1180, 635);
+        ctx.quadraticCurveTo(baseX + 1400, 565, baseX + WORLD_W, 650);
+        ctx.lineTo(baseX + WORLD_W, WORLD_H);
+        ctx.closePath();
+        ctx.fill();
+      }
+
+      // 3. Yakın Tepeler
+      ctx.fillStyle = scene.hillNear;
+      for (let copy = -1; copy <= 1; copy++) {
+        const baseX = copy * WORLD_W - this.bgLayers.midScroll;
+        ctx.beginPath();
+        ctx.moveTo(baseX, WORLD_H);
+        ctx.lineTo(baseX, 690);
+        ctx.quadraticCurveTo(baseX + 320, 610, baseX + 680, 685);
+        ctx.quadraticCurveTo(baseX + 1040, 600, baseX + 1380, 680);
+        ctx.quadraticCurveTo(baseX + 1500, 650, baseX + WORLD_W, 690);
+        ctx.lineTo(baseX + WORLD_W, WORLD_H);
+        ctx.closePath();
+        ctx.fill();
+      }
+
+      // 4. Bayram Süslemeli Uzak Şehir Silüeti ve Kırmızı-Beyaz Flamalar
+      for (let copy = -1; copy <= 1; copy++) {
+        const baseX = copy * WORLD_W - this.bgLayers.cityScroll;
+        this.drawFestiveCityStrip(ctx, baseX, scene.cityColor);
+      }
+    }
+
+    drawDecorativeCloud(ctx, x, y, scale) {
+      ctx.save();
+      ctx.translate(x, y);
+      ctx.scale(scale, scale);
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.62)';
+      ctx.beginPath();
+      ctx.arc(0, 0, 34, 0, Math.PI * 2);
+      ctx.arc(32, -8, 42, 0, Math.PI * 2);
+      ctx.arc(68, 2, 32, 0, Math.PI * 2);
+      ctx.arc(34, 14, 34, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+
+    drawFestiveCityStrip(ctx, baseX, color) {
+      ctx.save();
+      ctx.fillStyle = color;
+      const buildings = [
+        { x: 40, w: 90, h: 68 },
+        { x: 150, w: 70, h: 92 },
+        { x: 250, w: 110, h: 64 },
+        { x: 410, w: 85, h: 86, banner: '29 EKİM' },
+        { x: 530, w: 95, h: 62 },
+        { x: 670, w: 120, h: 95, banner: '1923' },
+        { x: 830, w: 80, h: 72 },
+        { x: 950, w: 110, h: 84 },
+        { x: 1110, w: 90, h: 66 },
+        { x: 1240, w: 125, h: 90, banner: 'CUMHURİYET' },
+        { x: 1410, w: 95, h: 74 }
+      ];
+      const groundY = 742;
+
+      buildings.forEach((b) => {
+        const bx = baseX + b.x;
+        const by = groundY - b.h;
+        ctx.fillStyle = color;
+        ctx.fillRect(bx, by, b.w, b.h + 20);
+
+        // Sıcak pencere ışıkları
+        ctx.fillStyle = 'rgba(255, 214, 102, 0.55)';
+        for (let wy = by + 12; wy < groundY - 14; wy += 18) {
+          for (let wx = bx + 12; wx < bx + b.w - 16; wx += 20) {
+            ctx.fillRect(wx, wy, 9, 10);
+          }
+        }
+
+        // Binalarda kırmızı-beyaz bayram flaması veya "1923" / "29 EKİM" panosu
+        if (b.banner) {
+          ctx.fillStyle = '#e30a17';
+          ctx.fillRect(bx + 6, by - 18, b.w - 12, 16);
+          ctx.fillStyle = '#ffffff';
+          ctx.font = 'bold 11px sans-serif';
+          ctx.textAlign = 'center';
+          ctx.fillText(b.banner, bx + b.w * 0.5, by - 6);
+        }
+      });
+
+      ctx.restore();
+    }
+
+    drawMenuPreviewScene(ctx) {
+      const t = this.menuAnimTime;
+      const previewX = 185 + (this.reducedMotion ? 0 : Math.sin(t * 1.4) * 28);
+      const previewY = 128 + (this.reducedMotion ? 0 : Math.cos(t * 1.8) * 14);
+      this.plane.propAngle = (t * 28) % (Math.PI * 2);
+      this.drawShowPlane(ctx, previewX, previewY, 0.04);
+
+      // Ön izleme bayrak rozeti
+      this.drawFlagBadge(ctx, {
+        x: 1415,
+        y: 128 + (this.reducedMotion ? 0 : Math.sin(t * 2.2) * 10),
+        r: 38,
+        waveOffset: t * 3
+      });
+    }
+
+    // --------------------------------------------------------------------------
+    // BAYRAM GÖSTERİ UÇAĞI ÇİZİMİ
+    // --------------------------------------------------------------------------
+    drawShowPlane(ctx, x, y, bankAngle) {
+      ctx.save();
+      ctx.translate(x, y);
+      ctx.rotate(bankAngle);
+
+      // Çarpışma sonrası saydam koruma kalkanı halkası (Yanıp sönme yok!)
+      if (this.plane.invulnTimer > 0) {
+        ctx.save();
+        ctx.beginPath();
+        ctx.arc(0, 0, 72, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(144, 224, 239, 0.22)';
+        ctx.fill();
+        ctx.lineWidth = 4;
+        ctx.strokeStyle = 'rgba(255, 209, 102, 0.92)';
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      // Kısa sıcak renkli temas uyarısı halesi
+      if (this.plane.hitFlashTimer > 0) {
+        ctx.save();
+        ctx.beginPath();
+        ctx.arc(0, 0, 62, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(255, 159, 28, 0.32)';
+        ctx.fill();
+        ctx.restore();
+      }
+
+      // Gösteri dumanı / beyaz-kırmızı zarif iz
+      if (!this.reducedMotion) {
+        const trailGrad = ctx.createLinearGradient(-125, 4, -54, 4);
+        trailGrad.addColorStop(0, 'rgba(255, 255, 255, 0)');
+        trailGrad.addColorStop(1, 'rgba(255, 255, 255, 0.78)');
+        ctx.fillStyle = trailGrad;
+        ctx.beginPath();
+        ctx.moveTo(-54, -2);
+        ctx.lineTo(-125, -10);
+        ctx.lineTo(-125, 14);
+        ctx.lineTo(-54, 8);
+        ctx.closePath();
+        ctx.fill();
+      }
+
+      // Yumuşak alt gölge (Arka plandan ayırır)
+      ctx.fillStyle = 'rgba(15, 37, 55, 0.22)';
+      ctx.beginPath();
+      ctx.ellipse(-2, 26, 54, 10, 0, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Kuyruk dikmesi (Kırmızı-Beyaz bayram boyaması)
+      ctx.fillStyle = '#e30a17';
+      ctx.strokeStyle = '#0f2537';
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(-54, -4);
+      ctx.lineTo(-62, -28);
+      ctx.lineTo(-38, -28);
+      ctx.lineTo(-26, -4);
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+
+      // Arka kanat
+      ctx.fillStyle = '#ffffff';
+      ctx.beginPath();
+      ctx.roundRect(-56, 0, 24, 9, 4);
+      ctx.fill();
+      ctx.stroke();
+
+      // Ana Gövde (Parlak Beyaz ve Bayram Kırmızısı Şerit)
+      ctx.fillStyle = '#ffffff';
+      ctx.beginPath();
+      ctx.moveTo(-52, -10);
+      ctx.quadraticCurveTo(-5, -20, 44, -12);
+      ctx.quadraticCurveTo(60, -8, 60, 2);
+      ctx.quadraticCurveTo(60, 14, 40, 16);
+      ctx.lineTo(-48, 12);
+      ctx.quadraticCurveTo(-58, 10, -56, -2);
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+
+      // Gövde üzeri kırmızı bayram şeridi
+      ctx.fillStyle = '#e30a17';
+      ctx.beginPath();
+      ctx.moveTo(-48, 0);
+      ctx.lineTo(52, -2);
+      ctx.lineTo(50, 9);
+      ctx.lineTo(-48, 8);
+      ctx.closePath();
+      ctx.fill();
+
+      // Kokpit Camı (Açık cam mavisi)
+      ctx.fillStyle = '#90e0ef';
+      ctx.beginPath();
+      ctx.ellipse(6, -12, 18, 9, -0.1, Math.PI, 0);
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+
+      // Alt/Orta Kanat (Altın uçlu kırmızı-beyaz kanat)
+      ctx.fillStyle = '#e30a17';
+      ctx.beginPath();
+      ctx.roundRect(-14, 4, 38, 13, 6);
+      ctx.fill();
+      ctx.stroke();
+
+      // Burun Konisi
+      ctx.fillStyle = '#ffb703';
+      ctx.beginPath();
+      ctx.arc(58, 2, 9, -Math.PI * 0.5, Math.PI * 0.5);
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+
+      // Dönen Pervane
+      const bladeLen = 18 + Math.sin(this.plane.propAngle) * 6;
+      ctx.strokeStyle = '#0f2537';
+      ctx.lineWidth = 4;
+      ctx.beginPath();
+      ctx.moveTo(64, 2 - bladeLen);
+      ctx.lineTo(64, 2 + bladeLen);
+      ctx.stroke();
+
+      ctx.restore();
+    }
+
+    // --------------------------------------------------------------------------
+    // BAYRAK SİMGESİ (ROZET) VE ENGELLERİN ÇİZİMİ
+    // --------------------------------------------------------------------------
+    drawFlagBadge(ctx, fl) {
+      ctx.save();
+      ctx.translate(fl.x, fl.y);
+
+      // Işıklı altın rozet halesi
+      const glow = ctx.createRadialGradient(0, 0, 12, 0, 0, 44);
+      glow.addColorStop(0, 'rgba(255, 209, 102, 0.9)');
+      glow.addColorStop(0.65, 'rgba(255, 183, 3, 0.35)');
+      glow.addColorStop(1, 'rgba(255, 183, 3, 0)');
+      ctx.fillStyle = glow;
+      ctx.beginPath();
+      ctx.arc(0, 0, 44, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Beyaz/Altın rozet çerçevesi
+      ctx.fillStyle = '#fffdf7';
+      ctx.strokeStyle = '#ffb703';
+      ctx.lineWidth = 3.5;
+      ctx.beginPath();
+      ctx.arc(0, 0, 32, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+
+      // İçinde doğru oranlı vektörel Türk Bayrağı (42x28)
+      drawTurkishFlag(ctx, 0, 0, 42, {
+        centered: true,
+        wavePhase: this.reducedMotion ? 0 : fl.waveOffset,
+        borderRadius: 4
+      });
+
+      ctx.restore();
+    }
+
+    drawObstacle(ctx, ob) {
+      ctx.save();
+      ctx.translate(ob.x, ob.y);
+
+      if (ob.type === 'windCloud') {
+        // 1. Önceden görülebilen Koyu Rüzgâr Bulutu (Dekoratif beyaz buluttan tamamen farklı!)
+        ctx.fillStyle = '#2b3a4a';
+        ctx.strokeStyle = '#90e0ef';
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.arc(-26, 6, 28, 0, Math.PI * 2);
+        ctx.arc(0, -10, 34, 0, Math.PI * 2);
+        ctx.arc(28, 4, 28, 0, Math.PI * 2);
+        ctx.arc(2, 14, 28, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+
+        // İnce rüzgâr çizgileri / kıvrımları
+        ctx.strokeStyle = '#e0fbfc';
+        ctx.lineWidth = 2.5;
+        ctx.beginPath();
+        ctx.moveTo(-36, -2);
+        ctx.quadraticCurveTo(-8, -12, 22, -2);
+        ctx.moveTo(-28, 12);
+        ctx.quadraticCurveTo(4, 4, 30, 12);
+        ctx.stroke();
+      } else if (ob.type === 'balloon') {
+        // 2. Sıcak Hava Balonu (Kırmızı kullanılmaz ki bayraklar ön planda kalsın!)
+        // Sepet
+        ctx.fillStyle = '#8d5524';
+        ctx.strokeStyle = '#0f2537';
+        ctx.lineWidth = 2.5;
+        ctx.fillRect(-14, 34, 28, 18);
+        ctx.strokeRect(-14, 34, 28, 18);
+
+        // Halatlar
+        ctx.beginPath();
+        ctx.moveTo(-10, 20);
+        ctx.lineTo(-10, 34);
+        ctx.moveTo(10, 20);
+        ctx.lineTo(10, 34);
+        ctx.stroke();
+
+        // Balon Gövdesi (Turkuaz, Altın Sarısı ve Lacivert Dilimler)
+        ctx.fillStyle = '#00a896';
+        ctx.beginPath();
+        ctx.ellipse(0, -8, 40, 44, 0, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+
+        ctx.fillStyle = '#ffb703';
+        ctx.beginPath();
+        ctx.ellipse(0, -8, 20, 44, 0, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+      } else {
+        // 3. Havada Bakım Şamandırası (Yuvarlak, açık konturlu, sarı-lacivert)
+        ctx.fillStyle = '#ffb703';
+        ctx.strokeStyle = '#0f2537';
+        ctx.lineWidth = 3.5;
+        ctx.beginPath();
+        ctx.arc(0, 0, ob.rX, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+
+        // İç lacivert halka ve uyarı yıldızı
+        ctx.fillStyle = '#1d3557';
+        ctx.beginPath();
+        ctx.arc(0, 0, ob.rX * 0.58, 0, Math.PI * 2);
+        ctx.fill();
+
+        ctx.fillStyle = '#ffffff';
+        ctx.beginPath();
+        ctx.arc(0, 0, 7, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      ctx.restore();
+    }
+
+    drawTutorialGuides(ctx) {
+      if (this.tutorial.step === 1) {
+        const ring = this.tutorial.ring;
+        ctx.save();
+        ctx.translate(ring.x, ring.y);
+        ctx.strokeStyle = '#ffd166';
+        ctx.lineWidth = 7;
+        ctx.setLineDash([14, 8]);
+        ctx.beginPath();
+        ctx.arc(0, 0, ring.r, 0, Math.PI * 2);
+        ctx.stroke();
+
+        ctx.fillStyle = 'rgba(255, 209, 102, 0.22)';
+        ctx.beginPath();
+        ctx.arc(0, 0, ring.r, 0, Math.PI * 2);
+        ctx.fill();
+
+        ctx.fillStyle = '#0f2537';
+        ctx.font = 'bold 20px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText('HEDEF HALKA', 0, 6);
+        ctx.restore();
+      } else if (this.tutorial.step === 3 && this.obstacles.length > 0) {
+        // Geniş güvenli geçit göstergesi
+        const gx = this.tutorial.safeGateX;
+        ctx.save();
+        ctx.strokeStyle = '#16803c';
+        ctx.fillStyle = 'rgba(22, 128, 60, 0.18)';
+        ctx.lineWidth = 5;
+        ctx.setLineDash([12, 8]);
+        ctx.beginPath();
+        ctx.roundRect(gx - 55, 390, 110, 220, 18);
+        ctx.fill();
+        ctx.stroke();
+
+        ctx.fillStyle = '#ffffff';
+        ctx.font = 'bold 20px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText('GÜVENLİ GEÇİT', gx, 505);
+        ctx.restore();
+      }
+    }
+
+    drawCelebrationPlaza(ctx) {
+      // Final Kutlama Meydanı Sahnesi
+      ctx.save();
+
+      // Meydan zemini
+      ctx.fillStyle = '#1d3557';
+      ctx.fillRect(0, 680, WORLD_W, 220);
+
+      // Meydan Kemeri ve "YAŞASIN CUMHURİYET! • 29 EKİM" Takı
+      ctx.fillStyle = '#fffdf7';
+      ctx.strokeStyle = '#ffb703';
+      ctx.lineWidth = 5;
+      ctx.fillRect(720, 230, 560, 450);
+      ctx.strokeRect(720, 230, 560, 450);
+
+      // Kemer açıklığı
+      ctx.fillStyle = '#4ea8de';
+      ctx.beginPath();
+      ctx.arc(1000, 480, 140, Math.PI, 0);
+      ctx.lineTo(1140, 680);
+      ctx.lineTo(860, 680);
+      ctx.closePath();
+      ctx.fill();
+
+      // Üst Alınlık: "YAŞASIN CUMHURİYET!"
+      ctx.fillStyle = '#e30a17';
+      ctx.fillRect(740, 250, 520, 58);
+      ctx.fillStyle = '#ffffff';
+      ctx.font = 'bold 30px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('YAŞASIN CUMHURİYET! • 1923', 1000, 289);
+
+      // Meydanda Büyük, Doğru Çizilmiş Türk Bayrağı
+      drawTurkishFlag(ctx, 1000, 135, 225, {
+        centered: true,
+        wavePhase: this.reducedMotion ? 0 : this.winGlideTimer * 3,
+        borderRadius: 8
+      });
+
+      ctx.restore();
+    }
+
+    drawConfetti(ctx) {
+      this.confetti.forEach((c) => {
+        ctx.save();
+        ctx.translate(c.x, c.y);
+        ctx.rotate(c.rot);
+        ctx.fillStyle = c.color;
+        ctx.fillRect(-7, -4, 14, 8);
+        ctx.restore();
+      });
+    }
+
+    drawParticlesAndTexts(ctx) {
+      this.particles.forEach((p) => {
+        const alpha = clamp(p.life / p.maxLife, 0, 1);
+        ctx.save();
+        ctx.globalAlpha = alpha;
+        if (p.isRing) {
+          ctx.strokeStyle = p.color;
+          ctx.lineWidth = 4;
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+          ctx.stroke();
+        } else {
+          ctx.fillStyle = p.color;
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+          ctx.fill();
+        }
+        ctx.restore();
+      });
+
+      this.floatingTexts.forEach((ft) => {
+        const alpha = clamp(ft.life / ft.maxLife, 0, 1);
+        ctx.save();
+        ctx.globalAlpha = alpha;
+        ctx.font = '900 28px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.strokeStyle = '#0f2537';
+        ctx.lineWidth = 5;
+        ctx.strokeText(ft.text, ft.x, ft.y);
+        ctx.fillStyle = ft.color;
+        ctx.fillText(ft.text, ft.x, ft.y);
+        ctx.restore();
+      });
+    }
+  }
+
+  // ============================================================================
+  // 7. BAŞLATMA VE DIŞA AKTARIM (Test Edilebilirlik İçin)
+  // ============================================================================
+  window.GokyuzuGoreviExport = {
+    WORLD_W,
+    WORLD_H,
+    HUD_SAFE_Y,
+    DOCK_SAFE_Y,
+    PLANE_VISUAL_W,
+    PLANE_VISUAL_H,
+    PLANE_HITBOX_W,
+    PLANE_HITBOX_H,
+    PLAY_MIN_X,
+    PLAY_MAX_X,
+    PLAY_MIN_Y,
+    PLAY_MAX_Y,
+    TARGET_FLAGS,
+    POINTS_PER_FLAG,
+    INITIAL_LIVES,
+    DIFFICULTY_MODES,
+    SCENES,
+    TRACK_TEMPLATES,
+    createPRNG,
+    validateSegmentTransition,
+    drawTurkishFlag,
+    GokyuzuGoreviGame
+  };
+
+  window.addEventListener('DOMContentLoaded', () => {
+    window.gameInstance = new GokyuzuGoreviGame();
+  });
+})();

@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>29 Ekim Gökyüzü Görevi — Cumhuriyet İçin Uç, Bayrakları Topla!</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="app-shell" class="app-shell">
+    <!-- Ana Oyun Çerçevesi (16:9 Oranlı Sahne ve Kontroller) -->
+    <div id="stage-wrapper" class="stage-wrapper">
+      
+      <!-- Üst Bilgi Şeridi (HUD) - Yalnızca aktif uçuş ve eğitimde görünür -->
+      <header id="hud-bar" class="hud-bar hidden" role="region" aria-label="Uçuş Bilgileri">
+        <div class="hud-left">
+          <div class="hud-badge hud-flags" aria-live="polite">
+            <span class="hud-icon" aria-hidden="true">🚩</span>
+            <span id="hud-flag-text">Bayrak 0/15</span>
+          </div>
+          <div class="hud-badge hud-score" aria-live="polite">
+            <span class="hud-icon" aria-hidden="true">⭐</span>
+            <span id="hud-score-text">Puan 0</span>
+          </div>
+          <div class="hud-badge hud-lives" id="hud-lives-box" aria-live="polite">
+            <span id="hud-hearts" class="hud-hearts" aria-hidden="true">❤️❤️❤️</span>
+            <span id="hud-lives-text" class="hud-lives-label">3 can</span>
+          </div>
+        </div>
+
+        <div class="hud-center">
+          <div id="hud-scene-badge" class="hud-scene-badge">
+            1. Sahne: Bayram Sabahı
+          </div>
+        </div>
+
+        <div class="hud-right">
+          <button type="button" id="hud-sound-btn" class="hud-ctrl-btn" aria-label="Sesi Aç veya Kapat">
+            <span id="hud-sound-icon" aria-hidden="true">🔇</span>
+            <span id="hud-sound-label">Ses Kapalı</span>
+          </button>
+          <button type="button" id="hud-fullscreen-btn" class="hud-ctrl-btn" aria-label="Tam Ekran">
+            <span aria-hidden="true">⛶</span>
+            <span id="hud-fs-label">Tam Ekran</span>
+          </button>
+          <button type="button" id="hud-pause-btn" class="hud-ctrl-btn hud-pause-btn" aria-label="Oyunu Duraklat">
+            <span aria-hidden="true">⏸</span>
+            <span>Duraklat</span>
+          </button>
+        </div>
+      </header>
+
+      <!-- Oyun Canvas Alanı -->
+      <main id="canvas-container" class="canvas-container">
+        <canvas id="game-canvas" width="1600" height="900" aria-label="29 Ekim Gökyüzü Görevi Uçuş Alanı"></canvas>
+
+        <!-- Kısa Oyun İçi Bildirim Balonu (HUD altında, sahneyi kapatmaz) -->
+        <div id="toast-banner" class="toast-banner hidden" aria-live="polite"></div>
+
+        <!-- Etkileşimli Eğitim Uçuşu Üst Bilgi Kutusu -->
+        <section id="tutorial-panel" class="tutorial-panel hidden" aria-live="polite" aria-label="Eğitim Uçuşu Yönergesi">
+          <div class="tutorial-step-content">
+            <span id="tutorial-step-badge" class="tutorial-step-badge">Alıştırma 1/3</span>
+            <p id="tutorial-instruction" class="tutorial-instruction">Uçağı yukarıdaki hedef halkaya götür.</p>
+          </div>
+          <div class="tutorial-actions">
+            <button type="button" id="tutorial-ready-btn" class="btn btn-primary btn-compact hidden">
+              Hazırım — Uçuşa Başla!
+            </button>
+            <button type="button" id="tutorial-skip-btn" class="btn btn-secondary btn-compact">
+              Alıştırmayı Atla
+            </button>
+          </div>
+        </section>
+
+        <!-- Sahne Geçiş Başlığı (5. ve 10. bayrakta 1.2 sn) -->
+        <div id="transition-overlay" class="transition-overlay hidden" role="status" aria-live="assertive">
+          <div class="transition-card">
+            <p class="transition-kicker">Harika Uçuş! Yeni Rotaya Geçiliyor</p>
+            <h2 id="transition-title" class="transition-title">2. Sahne: Rüzgâr Rotası</h2>
+            <p id="transition-desc" class="transition-desc">Rotanı seç, güvenle uç, bayrakları topla!</p>
+          </div>
+        </div>
+
+        <!-- Devam Etme Geri Sayımı (3 - 2 - 1) -->
+        <div id="countdown-overlay" class="countdown-overlay hidden" role="status" aria-live="assertive">
+          <div class="countdown-card">
+            <p class="countdown-label">Uçuşa Hazırlan</p>
+            <div id="countdown-number" class="countdown-number">3</div>
+            <button type="button" id="countdown-cancel-btn" class="btn btn-secondary btn-compact">
+              Duraklatmada Kal
+            </button>
+          </div>
+        </div>
+
+        <!-- ANA MENÜ EKRANI -->
+        <section id="menu-screen" class="overlay-screen menu-screen" aria-label="Ana Menü">
+          <div class="menu-card">
+            <div class="festival-ribbon">29 Ekim Cumhuriyet Bayramı • 1923</div>
+            <h1 class="main-title">29 Ekim Gökyüzü Görevi</h1>
+            <p class="main-subtitle">Cumhuriyet İçin Uç, Bayrakları Topla!</p>
+            <p class="main-hook">15 bayrağı toplayıp bayram uçuşunu tamamlayabilir misin?</p>
+
+            <!-- İki Anlaşılır Zorluk Seçeneği -->
+            <div class="difficulty-group" role="radiogroup" aria-label="Uçuş Modu Seçimi">
+              <button type="button" id="mode-rahat-btn" class="mode-card selected" role="radio" aria-checked="true" data-mode="rahat">
+                <span class="mode-title">🌤️ Rahat Uçuş</span>
+                <span class="mode-desc">Daha sakin hız ve geniş güvenli koridorlar (3–4. sınıf ve yeni başlayanlar)</span>
+              </button>
+              <button type="button" id="mode-kesif-btn" class="mode-card" role="radio" aria-checked="false" data-mode="kesif">
+                <span class="mode-title">🦅 Keşif Uçuşu</span>
+                <span class="mode-desc">Daha canlı akış ve dinamik rotalar (5–6. sınıf ve deneyimli pilotlar)</span>
+              </button>
+            </div>
+
+            <!-- Ana Eylem Düğmeleri -->
+            <div class="menu-main-actions">
+              <button type="button" id="start-flight-btn" class="btn btn-primary btn-hero">
+                ✈️ Uçuşa Başla
+              </button>
+              <button type="button" id="start-tutorial-btn" class="btn btn-accent">
+                🎯 Eğitim Uçuşu (15 sn)
+              </button>
+            </div>
+
+            <!-- Yardımcı Kontroller -->
+            <div class="menu-utility-actions">
+              <button type="button" id="how-to-play-btn" class="btn btn-utility">
+                ❓ Nasıl Oynanır?
+              </button>
+              <button type="button" id="menu-sound-btn" class="btn btn-utility" aria-label="Sesi Aç veya Kapat">
+                <span id="menu-sound-icon" aria-hidden="true">🔇</span>
+                <span id="menu-sound-label">Ses: Kapalı</span>
+              </button>
+              <button type="button" id="menu-fullscreen-btn" class="btn btn-utility">
+                ⛶ Tam Ekran
+              </button>
+            </div>
+          </div>
+        </section>
+
+        <!-- NASIL OYNANIR PENCERESİ -->
+        <section id="howto-modal" class="overlay-screen hidden" role="dialog" aria-modal="true" aria-labelledby="howto-title">
+          <div class="dialog-card howto-card">
+            <h2 id="howto-title" class="dialog-title">Nasıl Oynanır?</h2>
+            <p class="dialog-lead">Rotanı seç, güvenle uç, 15 Türk bayrağı simgesini toplayarak kutlama meydanına ulaş!</p>
+            <div class="howto-grid">
+              <div class="howto-item">
+                <h3>👆 1. Akıllı Tahta Kontrol Paneli</h3>
+                <p>Ekranın altındaki geniş <strong>“Parmağını burada hareket ettir”</strong> alanında parmağını kaydırarak uçağı ekranı kapatmadan rahatça yönlendir.</p>
+              </div>
+              <div class="howto-item">
+                <h3>✋ 2. Doğrudan Sürükleme</h3>
+                <p>Uçağın üzerine veya yakın çevresine parmağınla ya da fareyle dokunup sürükleyerek uçağı istediğin rotaya taşı.</p>
+              </div>
+              <div class="howto-item">
+                <h3>⌨️ 3. Yön Düğmeleri ve Klavye</h3>
+                <p>Sağ alttaki büyük yön düğmelerine basılı tut veya klavyede <strong>Ok Tuşları / WASD</strong> ile uç.</p>
+              </div>
+              <div class="howto-item">
+                <h3>⚠️ Engellere Dikkat Et</h3>
+                <p>Beyaz bulutlar zararsızdır. <strong>Koyu rüzgâr bulutu</strong>, <strong>sıcak hava balonu</strong> ve <strong>bakım şamandırasından</strong> uzak dur!</p>
+              </div>
+            </div>
+            <div class="dialog-actions">
+              <button type="button" id="howto-tutorial-btn" class="btn btn-accent">
+                🎯 Uygulamalı Eğitimi Aç
+              </button>
+              <button type="button" id="howto-close-btn" class="btn btn-primary">
+                Anladım, Menüye Dön
+              </button>
+            </div>
+          </div>
+        </section>
+
+        <!-- DURAKLATMA EKRANI -->
+        <section id="pause-screen" class="overlay-screen hidden" role="dialog" aria-modal="true" aria-labelledby="pause-title">
+          <div class="dialog-card">
+            <h2 id="pause-title" class="dialog-title">Uçuş Duraklatıldı</h2>
+            <p id="pause-status-text" class="dialog-lead">Bayrak: 0/15 • Puan: 0 • Can: 3</p>
+
+            <div id="pause-main-buttons" class="dialog-actions dialog-actions-vertical">
+              <button type="button" id="resume-btn" class="btn btn-primary">
+                ▶️ Devam Et
+              </button>
+              <button type="button" id="pause-restart-btn" class="btn btn-accent">
+                🔄 Yeniden Başlat
+              </button>
+              <button type="button" id="pause-menu-btn" class="btn btn-secondary">
+                🏠 Ana Menü
+              </button>
+            </div>
+
+            <!-- Kısa Onay Kutusu (Yeniden başlat veya Ana menü seçildiğinde) -->
+            <div id="pause-confirm-box" class="pause-confirm-box hidden" role="alertdialog" aria-labelledby="confirm-msg">
+              <p id="confirm-msg" class="confirm-msg">Mevcut uçuş turu sonlandırılacak. Onaylıyor musun?</p>
+              <div class="dialog-actions">
+                <button type="button" id="confirm-yes-btn" class="btn btn-primary">
+                  Evet, Onayla
+                </button>
+                <button type="button" id="confirm-cancel-btn" class="btn btn-secondary">
+                  Vazgeç
+                </button>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- BAŞARI EKRANI (15 Bayrak Tamamlandığında) -->
+        <section id="win-screen" class="overlay-screen hidden" role="dialog" aria-modal="true" aria-labelledby="win-title">
+          <div class="dialog-card win-card">
+            <div class="festival-ribbon">Yaşasın Cumhuriyet! • 29 Ekim Cumhuriyet Bayramı</div>
+            <h2 id="win-title" class="dialog-title win-title">Bayram uçuşu tamamlandı!</h2>
+            <p class="dialog-lead win-message">15 bayrağı topladın. Cumhuriyet Bayramımız kutlu olsun!</p>
+
+            <div class="win-stats">
+              <div class="stat-pill">
+                <span class="stat-label">Toplanan Bayrak</span>
+                <strong id="win-flags-val" class="stat-value">15 / 15</strong>
+              </div>
+              <div class="stat-pill">
+                <span class="stat-label">Toplam Puan</span>
+                <strong id="win-score-val" class="stat-value">150</strong>
+              </div>
+              <div class="stat-pill">
+                <span class="stat-label">Kalan Can</span>
+                <strong id="win-lives-val" class="stat-value">3 Can</strong>
+              </div>
+            </div>
+
+            <div class="dialog-actions">
+              <button type="button" id="win-replay-btn" class="btn btn-primary btn-hero">
+                ✈️ Yeniden Uç
+              </button>
+              <button type="button" id="win-menu-btn" class="btn btn-secondary">
+                🏠 Ana Menü
+              </button>
+            </div>
+          </div>
+        </section>
+
+        <!-- UÇUŞ SONU / MOLA EKRANI (3 Can Bittiğinde) -->
+        <section id="lost-screen" class="overlay-screen hidden" role="dialog" aria-modal="true" aria-labelledby="lost-title">
+          <div class="dialog-card lost-card">
+            <h2 id="lost-title" class="dialog-title">Uçuş molası</h2>
+            <p class="dialog-lead">Yeni bir rota deneyebilirsin!</p>
+
+            <div class="win-stats">
+              <div class="stat-pill">
+                <span class="stat-label">Toplanan Bayrak</span>
+                <strong id="lost-flags-val" class="stat-value">0 / 15</strong>
+              </div>
+              <div class="stat-pill">
+                <span class="stat-label">Toplam Puan</span>
+                <strong id="lost-score-val" class="stat-value">0</strong>
+              </div>
+            </div>
+
+            <div class="dialog-actions">
+              <button type="button" id="lost-retry-btn" class="btn btn-primary btn-hero">
+                🔄 Tekrar Dene
+              </button>
+              <button type="button" id="lost-menu-btn" class="btn btn-secondary">
+                🏠 Ana Menü
+              </button>
+            </div>
+          </div>
+        </section>
+      </main>
+
+      <!-- Alt Akıllı Tahta Kontrol Bandı (Uçuş sahnesini kapatmaz, ayrı şeritte yer alır) -->
+      <footer id="control-dock" class="control-dock hidden" aria-label="Dokunmatik Uçuş Kontrolleri">
+        <!-- A. Göreli Kontrol Paneli -->
+        <div id="relative-touch-pad" class="relative-touch-pad" role="application" aria-label="Parmağını burada hareket ettir - Göreli Uçak Kontrol Alanı">
+          <div class="touch-pad-inner">
+            <span class="touch-pad-icon" aria-hidden="true">👆</span>
+            <div class="touch-pad-text">
+              <strong>Parmağını burada hareket ettir</strong>
+              <span>Göreli tahta kontrol alanı — elin uçağı kapatmadan güvenle yönlendir</span>
+            </div>
+          </div>
+          <div id="touch-pad-ripple" class="touch-pad-ripple hidden" aria-hidden="true"></div>
+        </div>
+
+        <!-- C. Büyük Yön Düğmeleri (En az 64x64 CSS px) -->
+        <div class="dpad-container" role="group" aria-label="Yön Düğmeleri">
+          <button type="button" id="dpad-left" class="dpad-btn" data-dir="left" aria-label="Sola Uç">
+            <span aria-hidden="true">◀</span>
+          </button>
+          <button type="button" id="dpad-up" class="dpad-btn" data-dir="up" aria-label="Yukarı Uç">
+            <span aria-hidden="true">▲</span>
+          </button>
+          <button type="button" id="dpad-down" class="dpad-btn" data-dir="down" aria-label="Aşağı Uç">
+            <span aria-hidden="true">▼</span>
+          </button>
+          <button type="button" id="dpad-right" class="dpad-btn" data-dir="right" aria-label="Sağa Uç">
+            <span aria-hidden="true">▶</span>
+          </button>
+        </div>
+      </footer>
+
+    </div>
+  </div>
+
+  <script src="game.js"></script>
+</body>
+</html>
